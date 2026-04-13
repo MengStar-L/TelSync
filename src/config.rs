@@ -13,6 +13,15 @@ pub struct AppConfig {
     pub local_path: String,
     /// 最大并发下载数
     pub max_concurrent_downloads: usize,
+    /// Aria2 代理服务器 (all-proxy)
+    #[serde(default)]
+    pub proxy_url: String,
+    /// Aria2 代理用户名 (all-proxy-user)
+    #[serde(default)]
+    pub proxy_user: String,
+    /// Aria2 代理密码 (all-proxy-passwd)
+    #[serde(default)]
+    pub proxy_passwd: String,
 }
 
 impl Default for AppConfig {
@@ -22,6 +31,9 @@ impl Default for AppConfig {
             access_token: String::new(),
             local_path: String::new(),
             max_concurrent_downloads: 2,
+            proxy_url: String::new(),
+            proxy_user: String::new(),
+            proxy_passwd: String::new(),
         }
     }
 }

@@ -162,7 +162,7 @@ pub fn check_aria2_exists() -> bool {
     std::path::Path::new(aria2_exe).exists()
 }
 
-pub fn spawn_aria2(local_dir: &str, port: u16, max_concurrent: usize) -> Result<(), String> {
+pub fn spawn_aria2(local_dir: &str, port: u16, max_concurrent: usize, proxy_url: &str, proxy_user: &str, proxy_passwd: &str) -> Result<(), String> {
     let aria2_exe = if cfg!(windows) {
         ".\\aria2c.exe"
     } else {
@@ -175,8 +175,8 @@ pub fn spawn_aria2(local_dir: &str, port: u16, max_concurrent: usize) -> Result<
 
     info!("启动 Aria2 进程 (端口 {})...", port);
     // 使用 Command 启动子进程，并将输出放入 null 以避免污染日志
-    let child = Command::new(aria2_exe)
-        .arg("--enable-rpc=true")
+    let mut cmd = Command::new(aria2_exe);
+    cmd.arg("--enable-rpc=true")
         .arg(format!("--rpc-listen-port={}", port))
         .arg("--rpc-listen-all=false")
         .arg("--rpc-allow-origin-all=true")
@@ -184,12 +184,27 @@ pub fn spawn_aria2(local_dir: &str, port: u16, max_concurrent: usize) -> Result<
         .arg("--continue=true")
         .arg("--auto-file-renaming=false")
         .arg("--allow-overwrite=false")
-        .arg(format!("--dir={}", local_dir))
+        .arg(format!("--dir={}", local_dir));
+
+    // 代理配置
+    if !proxy_url.is_empty() {
+        cmd.arg(format!("--all-proxy={}", proxy_url));
+        if !proxy_user.is_empty() {
+            cmd.arg(format!("--all-proxy-user={}", proxy_user));
+        }
+        if !proxy_passwd.is_empty() {
+            cmd.arg(format!("--all-proxy-passwd={}", proxy_passwd));
+        }
+        info!("Aria2 代理已配置: {}", proxy_url);
+    }
+
+    let child = cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("无法启动 aria2: {}", e))?;
+
 
     // 监控意外退出
     let mut child = child;

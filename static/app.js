@@ -283,6 +283,9 @@ async function loadConfig() {
             document.getElementById('inputAccessToken').value = c.access_token || '';
             document.getElementById('inputLocalPath').value = c.local_path || '';
             document.getElementById('inputMaxConcurrent').value = c.max_concurrent_downloads || 2;
+            document.getElementById('inputProxyUrl').value = c.proxy_url || '';
+            document.getElementById('inputProxyUser').value = c.proxy_user || '';
+            document.getElementById('inputProxyPasswd').value = c.proxy_passwd || '';
             if (c.teldrive_url && c.access_token) setConnectionStatus(true);
 
             const treesResp = await API.getTrees();
@@ -308,6 +311,9 @@ async function saveConfig() {
             access_token: document.getElementById('inputAccessToken').value.trim(),
             local_path: document.getElementById('inputLocalPath').value.trim(),
             max_concurrent_downloads: parseInt(document.getElementById('inputMaxConcurrent').value) || 2,
+            proxy_url: document.getElementById('inputProxyUrl').value.trim(),
+            proxy_user: document.getElementById('inputProxyUser').value.trim(),
+            proxy_passwd: document.getElementById('inputProxyPasswd').value.trim(),
         };
         const resp = await API.saveConfig(data);
         if (resp.success) { showToast('success', '配置已保存'); setConnectionStatus(true); }

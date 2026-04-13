@@ -19,6 +19,9 @@ pub struct ConfigUpdate {
     pub access_token: Option<String>,
     pub local_path: Option<String>,
     pub max_concurrent_downloads: Option<usize>,
+    pub proxy_url: Option<String>,
+    pub proxy_user: Option<String>,
+    pub proxy_passwd: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -74,6 +77,15 @@ pub async fn save_config(
     if let Some(max) = update.max_concurrent_downloads {
         config.max_concurrent_downloads = max.clamp(1, 5);
     }
+    if let Some(proxy_url) = update.proxy_url {
+        config.proxy_url = proxy_url;
+    }
+    if let Some(proxy_user) = update.proxy_user {
+        config.proxy_user = proxy_user;
+    }
+    if let Some(proxy_passwd) = update.proxy_passwd {
+        config.proxy_passwd = proxy_passwd;
+    }
     config.save().map_err(|e| err_response::<String>(&e))?;
     
     // 实时生效 Aria2 配置
@@ -81,6 +93,18 @@ pub async fn save_config(
     options.insert(
         "max-concurrent-downloads".to_string(),
         serde_json::json!(config.max_concurrent_downloads.to_string()),
+    );
+    options.insert(
+        "all-proxy".to_string(),
+        serde_json::json!(config.proxy_url),
+    );
+    options.insert(
+        "all-proxy-user".to_string(),
+        serde_json::json!(config.proxy_user),
+    );
+    options.insert(
+        "all-proxy-passwd".to_string(),
+        serde_json::json!(config.proxy_passwd),
     );
     let _ = state.aria2_client.change_global_option(serde_json::Value::Object(options)).await;
 
@@ -802,7 +826,7 @@ pub async fn install_aria2(
     // 自动触发启动
     let config = state.config.read().await;
     let local_path = if config.local_path.is_empty() { "." } else { &config.local_path };
-    if let Err(e) = crate::aria2::spawn_aria2(local_path, 16800, config.max_concurrent_downloads) {
+    if let Err(e) = crate::aria2::spawn_aria2(local_path, 16800, config.max_concurrent_downloads, &config.proxy_url, &config.proxy_user, &config.proxy_passwd) {
         tracing::error!("Aria2 提取成功但自动启动失败: {}", e);
     } else {
         info!("Aria2 安装后自动启动成功");
@@ -834,7 +858,7 @@ pub async fn upload_aria2(
             // 自动触发启动
             let config = state.config.read().await;
             let local_path = if config.local_path.is_empty() { "." } else { &config.local_path };
-            if let Err(e) = crate::aria2::spawn_aria2(local_path, 16800, config.max_concurrent_downloads) {
+            if let Err(e) = crate::aria2::spawn_aria2(local_path, 16800, config.max_concurrent_downloads, &config.proxy_url, &config.proxy_user, &config.proxy_passwd) {
                 tracing::error!("Aria2 上传成功但自动启动失败: {}", e);
             } else {
                 info!("Aria2 上传后自动启动成功");

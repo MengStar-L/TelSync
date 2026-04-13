@@ -250,6 +250,29 @@
                         </div>
                     </div>
                 </div>
+                <div class="settings-section">
+                    <div class="settings-section-header">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent-purple, #6C5CE7)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                        <h3>代理设置</h3>
+                    </div>
+                    <div class="settings-group">
+                        <div class="form-group">
+                            <label for="inputProxyUrl">代理服务器 <span style="color:#94a3b8;font-weight:400">(all-proxy)</span></label>
+                            <input type="text" id="inputProxyUrl" placeholder="例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080">
+                            <small>留空表示不使用代理，支持 http / https / socks5 协议</small>
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group" style="flex:1">
+                                <label for="inputProxyUser">代理用户名 <span style="color:#94a3b8;font-weight:400">(all-proxy-user)</span></label>
+                                <input type="text" id="inputProxyUser" placeholder="无需认证可留空">
+                            </div>
+                            <div class="form-group" style="flex:1">
+                                <label for="inputProxyPasswd">代理密码 <span style="color:#94a3b8;font-weight:400">(all-proxy-passwd)</span></label>
+                                <input type="password" id="inputProxyPasswd" placeholder="无需认证可留空">
+                            </div>
+                        </div>
+                    </div>
+                </div>
                 <div class="settings-actions">
                     <button class="btn btn-secondary" id="btnTestConnection">
                         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>

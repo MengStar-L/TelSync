@@ -6,3 +6,6 @@ _diff.txt
 .vscode/
 *.zip
 *.tar.gz
+*.bz2
+aria2.zip
+aria2.tar.gz
