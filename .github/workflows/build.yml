@@ -1,0 +1,91 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            name: windows-amd64
+            runner: windows-latest
+            ext: .exe
+          - target: x86_64-unknown-linux-musl
+            name: linux-amd64
+            runner: ubuntu-latest
+            ext: ""
+          - target: aarch64-unknown-linux-musl
+            name: linux-arm64
+            runner: ubuntu-latest
+            ext: ""
+
+    runs-on: ${{ matrix.runner }}
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Windows: 直接用 cargo 构建
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # Linux: 使用 cross 交叉编译
+      - name: Install cross
+        if: runner.os == 'Linux'
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: cross build --release --target ${{ matrix.target }}
+
+      # 重命名产物
+      - name: Prepare artifact (Unix)
+        if: runner.os == 'Linux'
+        run: |
+          cp target/${{ matrix.target }}/release/telsync telsync-${{ matrix.name }}
+          chmod +x telsync-${{ matrix.name }}
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          Copy-Item "target/${{ matrix.target }}/release/telsync.exe" "telsync-${{ matrix.name }}.exe"
+
+      # 上传构建产物
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: telsync-${{ matrix.name }}
+          path: telsync-${{ matrix.name }}${{ matrix.ext }}
+
+  # 只有 tag 推送时才创建 Release
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/**/*
