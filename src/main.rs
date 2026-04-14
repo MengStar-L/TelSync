@@ -35,7 +35,16 @@ async fn main() {
     
     // 如果存在本地 aria2，则启动它作为子进程（如果不存在，前台页面引导用户下载）
     if aria2::check_aria2_exists() {
-        let _ = aria2::spawn_aria2(&config.local_path, rpc_port, config.max_concurrent_downloads, &config.proxy_url, &config.proxy_user, &config.proxy_passwd);
+        let _ = aria2::spawn_aria2(
+            &config.local_path,
+            rpc_port,
+            config.max_concurrent_downloads,
+            &config.proxy_url,
+            &config.proxy_user,
+            &config.proxy_passwd,
+            config.rpc_allow_remote,
+            &config.rpc_secret,
+        );
     } else {
         info!("未检测到 Aria2 核心，需要进入配置向导");
     }

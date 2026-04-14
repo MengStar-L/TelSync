@@ -12,68 +12,96 @@
 </head>
 <body>
     <!-- 统一安装向导 Modal -->
-    <div id="setupWizardModal" class="setup-overlay" style="display: none;">
-        <div class="setup-box">
-            <h2 style="text-align:center;margin-bottom:5px;">欢迎使用 TelSync</h2>
-            <p style="text-align:center;color:#666;font-size:0.9em;margin-bottom:20px;">首次使用需要进行简单的初始化配置</p>
-
-            <!-- 步骤 1: API 和本地目录配置 (未配置时显示) -->
-            <div id="setupConfigArea" style="display: none; border-bottom: 1px solid #eaeaea; padding-bottom: 20px; margin-bottom: 20px;">
-                <h3 style="font-size:1.1em;margin-bottom:15px;display:flex;align-items:center;gap:8px;">
-                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="var(--primary-color)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>
-                    基础通信配置
-                </h3>
-                <div class="form-group">
-                    <label>TelDrive 服务地址</label>
-                    <input type="text" id="setupTeldriveUrl" placeholder="如: http://192.168.1.10:8080" class="cfg-input">
-                </div>
-                <div class="form-group">
-                    <label>TelDrive 访问令牌 (Token)</label>
-                    <input type="password" id="setupTeldriveToken" placeholder="您的长 token" class="cfg-input">
-                </div>
-                <div class="form-group">
-                    <label>本地存储目录</label>
-                    <input type="text" id="setupLocalPath" placeholder="绝对路径(如 Windows: D:/Movies, Linux: /mnt/data)" class="cfg-input">
-                </div>
-                <!-- 保存配置按钮放在这里，不装 aria2 时也需要 -->
-                <button id="btnSaveConfigOnly" class="btn-primary" style="width: 100%; margin-top: 5px;">保存配置并开始</button>
+    <div id="setupWizardModal" class="wizard-overlay show">
+        <div class="wizard-card">
+            <div class="wizard-header">
+                <div class="wizard-logo"><i class="ph-fill ph-rocket-launch"></i></div>
+                <h2 class="wizard-title">初始化向导</h2>
+                <p class="wizard-subtitle" id="setupWizardSubtitle">首次运行需要配置基础环境</p>
             </div>
 
-            <!-- 步骤 2: Aria2 安装 (未安装时显示) -->
-            <div id="setupAria2Area" style="display: none;">
-                <h3 style="font-size:1.1em;margin-bottom:10px;display:flex;align-items:center;gap:8px;">
-                    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#2ED573" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-                    安装 Aria2 下载核心
-                </h3>
-                <p style="font-size:0.9em;color:#666;margin-bottom:15px;">系统未检测到 <code>aria2c</code>，请选择架构以下载并部署：</p>
-                <div class="setup-options">
-                    <div class="arch-cards" id="setupArchCards">
-                        <div class="arch-card active" data-value="win-x64">
-                            <span>Windows 64位</span>
-                        </div>
-                        <div class="arch-card" data-value="linux-x64">
-                            <span>Linux x86_64</span>
-                        </div>
-                        <div class="arch-card" data-value="linux-arm64">
-                            <span>Linux ARM64</span>
-                        </div>
+            <div class="wizard-dots">
+                <div class="wizard-dot active" id="dot1"></div>
+                <div class="wizard-dot" id="dot2"></div>
+                <div class="wizard-dot" id="dot3"></div>
+                <div class="wizard-dot" id="dot4"></div>
+            </div>
+
+            <!-- Step 1: TelDrive 配置 -->
+            <div class="wizard-step active" id="wStep1">
+                <div class="form-group">
+                    <label>TelDrive 服务器地址</label>
+                    <input type="url" id="teldriveUrl" class="form-input" placeholder="例如: https://teldrive.example.com">
+                </div>
+                <div class="form-group">
+                    <label>Access Token</label>
+                    <input type="password" id="teldriveToken" class="form-input" placeholder="输入从 Cookie 获取的 access_token">
+                </div>
+                <div class="wizard-footer">
+                    <div></div>
+                    <button class="btn btn-primary" onclick="testTeldriveConfig(this)">下一步 <i class="ph ph-arrow-right"></i></button>
+                </div>
+            </div>
+
+            <!-- Step 2: Aria2 核心安装 -->
+            <div class="wizard-step" id="wStep2">
+                <div class="wizard-status-card">
+                    <div class="wizard-status-row">
+                        <span class="wizard-status-badge info" id="wAria2InstallBadge"><i class="ph ph-circle-dashed"></i> 未安装</span>
+                        <span class="wizard-meta-item" style="font-weight:600; color:var(--text-primary)" id="wAria2InstallPercent">0%</span>
+                    </div>
+                    <div class="wizard-progress-track">
+                        <div class="wizard-progress-fill" id="wAria2InstallProgress" style="width: 0%"></div>
+                    </div>
+                    <p class="wizard-note" id="wAria2InstallText">准备就绪</p>
+                    <div class="wizard-meta-list" style="margin-top:4px;">
+                        <div class="wizard-meta-item"><span><i class="ph ph-terminal-window"></i> 核心路径</span> <strong id="wAria2BinaryPath">--</strong></div>
                     </div>
                 </div>
-                <button id="btnInstallAria2" class="btn-primary" style="margin-top: 15px; width: 100%;">部署核心并进入应用</button>
-                
-                <div id="installProgressArea" class="install-progress-area" style="display: none;">
-                    <div class="install-progress-bar-track">
-                        <div class="install-progress-bar-fill" id="installProgressFill"></div>
+                <div class="form-group" style="margin-top: 12px; text-align: left;">
+                    <label>选择系统架构</label>
+                    <select id="wAria2ArchSelect" class="form-input" style="padding: 8px 12px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 6px; color: var(--text-primary); font-size: 14px; width: 100%;">
+                        <option value="win-x64">Windows (x64)</option>
+                        <option value="linux-x64">Linux (amd64)</option>
+                        <option value="linux-arm64">Linux (arm64)</option>
+                    </select>
+                </div>
+                <div class="wizard-choice-grid" style="margin-top:12px;">
+                    <button class="btn btn-primary" id="wAria2AutoBtn" onclick="installAria2Core()"><i class="ph ph-cloud-arrow-down"></i> 一键下载核心</button>
+                    <button class="btn btn-ghost" id="wAria2UploadBtn" onclick="document.getElementById('uploadAria2Input').click()"><i class="ph ph-upload-simple"></i> 上传核心文件</button>
+                    <input type="file" id="uploadAria2Input" style="display:none" accept=".exe,application/octet-stream">
+                </div>
+                <div class="wizard-footer">
+                    <button class="btn btn-ghost" onclick="setWizardStep(1)"><i class="ph ph-arrow-left"></i> 上一步</button>
+                    <button class="btn btn-primary" id="wAria2NextBtn" onclick="setWizardStep(3)" disabled>下一步 <i class="ph ph-arrow-right"></i></button>
+                </div>
+            </div>
+
+            <!-- Step 3: 下载与代理设置 -->
+            <div class="wizard-step" id="wStep3">
+                <div class="form-group">
+                    <label>本地下载保存路径</label>
+                    <input type="text" id="localPath" class="form-input" placeholder="例如: D:\Downloads 或 /volume1/downloads">
+                </div>
+                <div class="form-group">
+                    <label>最大并发下载数</label>
+                    <input type="number" id="maxConcurrent" class="form-input" value="3" min="1" max="16">
+                </div>
+                <div class="form-group" style="margin-top: 12px;">
+                    <label>Aria2 代理配置 (可选)</label>
+                    <input type="text" id="proxyUrl" class="form-input" placeholder="代理地址，例如: http://127.0.0.1:7890">
+                </div>
+                <div style="display:flex; gap:12px;">
+                    <div class="form-group" style="flex:1;">
+                        <input type="text" id="proxyUser" class="form-input" placeholder="代理用户名 (可选)">
                     </div>
-                    <div class="install-progress-info">
-                        <span id="installStatusText">准备中...</span>
-                        <span id="installPercentText">0%</span>
+                    <div class="form-group" style="flex:1;">
+                        <input type="password" id="proxyPasswd" class="form-input" placeholder="代理密码 (可选)">
                     </div>
                 </div>
-                
-                <div class="setup-manual" style="margin-top: 15px; font-size: 0.85em; color: #666; text-align: center;">
-                    <p>或 <span id="btnUploadAria2" class="text-link" style="color:var(--primary-color); cursor:pointer;">手动上传</span> aria2c 二进制文件</p>
-                    <input type="file" id="uploadAria2Input" style="display:none">
+                <div class="wizard-footer">
+                    <button class="btn btn-ghost" onclick="setWizardStep(2)"><i class="ph ph-arrow-left"></i> 上一步</button>
+                    <button class="btn btn-primary" onclick="saveConfigAndStart(this)">保存并完成 <i class="ph ph-check"></i></button>
                 </div>
             </div>
         </div>
@@ -223,11 +251,20 @@
                     <div class="settings-group">
                         <div class="form-group">
                             <label for="inputTeldriveUrl">TelDrive 地址</label>
-                            <input type="url" id="inputTeldriveUrl" placeholder="例如: https://teldrive.example.com">
+                            <div class="input-with-btn">
+                                <input type="url" id="inputTeldriveUrl" placeholder="例如: https://teldrive.example.com">
+                                <i class="ph ph-check-circle save-icon"></i>
+                                <button class="btn btn-secondary btn-test" id="btnTestConnection">
+                                    测试连接
+                                </button>
+                            </div>
                         </div>
                         <div class="form-group">
                             <label for="inputAccessToken">Access Token (Cookie)</label>
-                            <input type="password" id="inputAccessToken" placeholder="从 Cookie 中复制 access_token 值">
+                            <div class="input-with-icon">
+                                <input type="password" id="inputAccessToken" placeholder="从 Cookie 中复制 access_token 值">
+                                <i class="ph ph-check-circle save-icon"></i>
+                            </div>
                             <small>在 TelDrive 网页登录后，F12 → Application → Cookies 获取</small>
                         </div>
                     </div>
@@ -240,12 +277,18 @@
                     <div class="settings-group">
                         <div class="form-group">
                             <label for="inputLocalPath">本地同步文件夹</label>
-                            <input type="text" id="inputLocalPath" placeholder="例如: D:\Downloads 或 /mnt/data/downloads">
+                            <div class="input-with-icon">
+                                <input type="text" id="inputLocalPath" placeholder="例如: D:\Downloads 或 /mnt/data/downloads">
+                                <i class="ph ph-check-circle save-icon"></i>
+                            </div>
                         </div>
                         <div class="form-row">
                             <div class="form-group" style="flex:1">
                                 <label for="inputMaxConcurrent">最大并发下载数</label>
-                                <input type="number" id="inputMaxConcurrent" min="1" max="5" value="2">
+                                <div class="input-with-icon">
+                                    <input type="number" id="inputMaxConcurrent" min="1" max="5" value="2">
+                                    <i class="ph ph-check-circle save-icon"></i>
+                                </div>
                             </div>
                         </div>
                     </div>
@@ -258,30 +301,62 @@
                     <div class="settings-group">
                         <div class="form-group">
                             <label for="inputProxyUrl">代理服务器 <span style="color:#94a3b8;font-weight:400">(all-proxy)</span></label>
-                            <input type="text" id="inputProxyUrl" placeholder="例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080">
+                            <div class="input-with-btn">
+                                <input type="text" id="inputProxyUrl" placeholder="例如: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080">
+                                <i class="ph ph-check-circle save-icon"></i>
+                                <button class="btn btn-secondary btn-test" id="btnTestProxy">
+                                    测试代理
+                                </button>
+                            </div>
                             <small>留空表示不使用代理，支持 http / https / socks5 协议</small>
                         </div>
                         <div class="form-row">
                             <div class="form-group" style="flex:1">
                                 <label for="inputProxyUser">代理用户名 <span style="color:#94a3b8;font-weight:400">(all-proxy-user)</span></label>
-                                <input type="text" id="inputProxyUser" placeholder="无需认证可留空">
+                                <div class="input-with-icon">
+                                    <input type="text" id="inputProxyUser" placeholder="无需认证可留空">
+                                    <i class="ph ph-check-circle save-icon"></i>
+                                </div>
                             </div>
                             <div class="form-group" style="flex:1">
                                 <label for="inputProxyPasswd">代理密码 <span style="color:#94a3b8;font-weight:400">(all-proxy-passwd)</span></label>
-                                <input type="password" id="inputProxyPasswd" placeholder="无需认证可留空">
+                                <div class="input-with-icon">
+                                    <input type="password" id="inputProxyPasswd" placeholder="无需认证可留空">
+                                    <i class="ph ph-check-circle save-icon"></i>
+                                </div>
                             </div>
                         </div>
                     </div>
                 </div>
-                <div class="settings-actions">
-                    <button class="btn btn-secondary" id="btnTestConnection">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
-                        测试连接
-                    </button>
-                    <button class="btn btn-primary" id="btnSaveConfig">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-                        保存配置
-                    </button>
+                <div class="settings-section">
+                    <div class="settings-section-header">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent-orange)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1v22"/><path d="M5 5h9a4 4 0 0 1 0 8H5z"/><path d="M5 13h11a4 4 0 0 1 0 8H5z"/></svg>
+                        <h3>Aria2 RPC 设置</h3>
+                    </div>
+                    <div class="settings-group">
+                        <div class="form-group">
+                            <label>允许外部访问</label>
+                            <label class="toggle-card" for="inputRpcListenAll">
+                                <div class="toggle-copy">
+                                    <strong>允许局域网或其他客户端访问 Aria2 RPC</strong>
+                                    <span>开启后等同于 `--rpc-listen-all=true`，建议同时设置 RPC 密码。</span>
+                                </div>
+                                <span class="toggle-switch">
+                                    <input type="checkbox" id="inputRpcListenAll">
+                                    <span class="toggle-slider"></span>
+                                </span>
+                            </label>
+                            <small>修改该项会自动重启 Aria2，使新的 RPC 监听范围立即生效。</small>
+                        </div>
+                        <div class="form-group">
+                            <label for="inputRpcSecret">RPC 密码 <span style="color:#94a3b8;font-weight:400">(rpc-secret)</span></label>
+                            <div class="input-with-icon">
+                                <input type="password" id="inputRpcSecret" placeholder="留空表示不设置密码">
+                                <i class="ph ph-check-circle save-icon"></i>
+                            </div>
+                            <small>保存后会自动重启 Aria2；TelSync 会同步使用该密码连接本地 RPC。</small>
+                        </div>
+                    </div>
                 </div>
                 <div class="test-result" id="testResult"></div>
             </div>

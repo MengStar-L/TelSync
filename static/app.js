@@ -18,6 +18,7 @@ const API = {
     clearFailed: () => fetch('/api/download/clear-failed', { method: 'POST' }).then(r => r.json()),
     clearAll: () => fetch('/api/download/clear-all', { method: 'POST' }).then(r => r.json()),
     getInitStatus: () => fetch('/api/system/init-status').then(r => r.json()),
+    getInstallProgress: () => fetch('/api/system/install-progress').then(r => r.json()),
     installAria2: (arch) => fetch('/api/system/install-aria2', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ arch }) }).then(r => r.json()),
     uploadAria2: (formData) => fetch('/api/system/upload-aria2', { method: 'POST', body: formData }).then(r => r.json()),
     
@@ -36,18 +37,24 @@ let currentDlFilter = 'all';
 let cachedRemoteNodes = [];
 let cachedLocalNodes = [];
 let treeRendered = false; 
+let lastSavedConfig = {};
 
 // ===== 初始化 =====
+let appStatus = {};
+
 document.addEventListener('DOMContentLoaded', async () => {
     // 基础鉴权状态
     try {
         const check = await API.getInitStatus();
         if (check.success) {
-            const status = check.data;
-            if (!status.aria2_installed || !status.app_configured) {
+            appStatus = check.data;
+            if (!appStatus.aria2_installed || !appStatus.app_configured) {
                 document.getElementById('setupWizardModal').style.display = 'flex';
-                initSetupEvents(status);
+                initSetupEvents(appStatus);
                 return; // 终止后续流程，等待配置完成后由 initSetupEvents 闭环
+            } else {
+                // 已全部配置，隐藏向导直接进入主应用
+                document.getElementById('setupWizardModal').style.display = 'none';
             }
         }
     } catch(e) { console.error('出厂检查出错', e); }
@@ -56,186 +63,330 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 function initSetupEvents(status) {
-    const areaConfig = document.getElementById('setupConfigArea');
-    const areaAria2 = document.getElementById('setupAria2Area');
-
-    if (!status.app_configured) areaConfig.style.display = 'block';
-    if (!status.aria2_installed) areaAria2.style.display = 'block';
-
-    // 区块 1: 配置项逻辑
-    document.getElementById('btnSaveConfigOnly').addEventListener('click', async () => {
-        const url = document.getElementById('setupTeldriveUrl').value.trim();
-        const token = document.getElementById('setupTeldriveToken').value.trim();
-        const localPath = document.getElementById('setupLocalPath').value.trim();
-        
-        if(!url || !token || !localPath) {
-            showToast('error', '请填写所有的必填项');
-            return;
-        }
-        
-        const btn = document.getElementById('btnSaveConfigOnly');
-        btn.disabled = true;
-        btn.textContent = '保存中...';
-        
-        try {
-            // 保留原本已经配置过的部分非必填字段
-            const oldConf = (await API.getConfig()).data || {};
-            const res = await API.saveConfig({ ...oldConf, teldrive_url: url, access_token: token, local_path: localPath });
+    // 加载已有配置到表单
+    API.getConfig().then(cfgRes => {
+        if (cfgRes.success && cfgRes.data) {
+            const data = cfgRes.data;
+            document.getElementById('teldriveUrl').value = data.teldrive_url || '';
+            document.getElementById('teldriveToken').value = data.access_token || '';
+            document.getElementById('localPath').value = data.local_path || '';
+            document.getElementById('maxConcurrent').value = data.max_concurrent_downloads || 3;
+            document.getElementById('proxyUrl').value = data.proxy_url || '';
+            document.getElementById('proxyUser').value = data.proxy_user || '';
+            document.getElementById('proxyPasswd').value = data.proxy_passwd || '';
             
-            if (res.success) {
-                showToast('success', '核心配置保存成功！');
-                if (status.aria2_installed) {
-                    // 若无须安装Aria2，即可直达系统
-                    document.getElementById('setupWizardModal').style.display = 'none';
-                    initMainApp();
+            // 判断跳转到哪一步
+            let stepToJump = 1;
+            const hasStep1 = !!(data.teldrive_url && data.access_token);
+            const hasStep2 = status.aria2_installed;
+            const hasStep3 = !!(data.local_path);
+            
+            if (!hasStep1) {
+                stepToJump = 1;
+            } else if (!hasStep2) {
+                stepToJump = 2;
+            } else if (!hasStep3 || !status.app_configured) {
+                stepToJump = 3;
+            } else {
+                stepToJump = 3;
+            }
+            
+            setWizardStep(stepToJump);
+            
+            // 渲染已经安装好 Aria2 的 UI
+            if (status.aria2_installed) {
+                const badge = document.getElementById('wAria2InstallBadge');
+                const text = document.getElementById('wAria2InstallText');
+                const progress = document.getElementById('wAria2InstallProgress');
+                const percent = document.getElementById('wAria2InstallPercent');
+                const btnNext = document.getElementById('wAria2NextBtn');
+                const btnAuto = document.getElementById('wAria2AutoBtn');
+                const btnUpload = document.getElementById('wAria2UploadBtn');
+                const archSelect = document.getElementById('wAria2ArchSelect');
+                
+                if (badge) {
+                    badge.className = 'wizard-status-badge success';
+                    badge.innerHTML = '<i class="ph ph-check-circle"></i> 已安装';
+                }
+                if (text) text.textContent = '检测到本地已有 Aria2 核心，已自动跳过下载';
+                if (progress) progress.style.width = '100%';
+                if (percent) percent.textContent = '100%';
+                if (btnNext) btnNext.disabled = false;
+                if (btnAuto) btnAuto.style.display = 'none';
+                if (btnUpload) btnUpload.style.display = 'none';
+                if (archSelect && archSelect.parentElement) archSelect.parentElement.style.display = 'none';
+            }
+        } else {
+            setWizardStep(1);
+        }
+    });
+
+    // 自动检测架构并设置默认选项
+    const archSelect = document.getElementById('wAria2ArchSelect');
+    if (archSelect) {
+        const ua = navigator.userAgent.toLowerCase();
+        if (ua.includes('win')) {
+            archSelect.value = 'win-x64';
+        } else if (ua.includes('linux')) {
+            if (ua.includes('aarch64') || ua.includes('arm')) {
+                archSelect.value = 'linux-arm64';
+            } else {
+                archSelect.value = 'linux-x64';
+            }
+        }
+    }
+
+    const inputUpload = document.getElementById('uploadAria2Input');
+    if(inputUpload) {
+        inputUpload.addEventListener('change', async (e) => {
+            if(e.target.files.length > 0) {
+                const formData = new FormData();
+                formData.append('file', e.target.files[0]);
+                
+                const badge = document.getElementById('wAria2InstallBadge');
+                const text = document.getElementById('wAria2InstallText');
+                const btnAuto = document.getElementById('wAria2AutoBtn');
+                const btnUpload = document.getElementById('wAria2UploadBtn');
+                
+                btnAuto.disabled = true;
+                btnUpload.disabled = true;
+                badge.className = 'wizard-status-badge warning';
+                badge.innerHTML = '<i class="ph ph-spinner ph-spin"></i> 上传中';
+                text.textContent = '正在上传核心文件...';
+
+                try {
+                    const res = await API.uploadAria2(formData);
+                    if(res.success) {
+                        badge.className = 'wizard-status-badge success';
+                        badge.innerHTML = '<i class="ph ph-check-circle"></i> 安装成功';
+                        text.textContent = '离线核心部署完毕';
+                        btnAuto.style.display = 'none';
+                        btnUpload.style.display = 'none';
+                        document.getElementById('wAria2NextBtn').disabled = false;
+                        showToast('success', '本地核心上传完毕，子进程已自动启动');
+                    } else {
+                        badge.className = 'wizard-status-badge error';
+                        badge.innerHTML = '<i class="ph ph-warning-circle"></i> 上传失败';
+                        text.textContent = res.message;
+                        btnAuto.disabled = false;
+                        btnUpload.disabled = false;
+                        showToast('error', '上传失败: ' + res.message);
+                    }
+                } catch(err) {
+                    badge.className = 'wizard-status-badge error';
+                    badge.innerHTML = '<i class="ph ph-warning-circle"></i> 上传异常';
+                    text.textContent = err.message;
+                    btnAuto.disabled = false;
+                    btnUpload.disabled = false;
+                    showToast('error', '上传错误: ' + err.message);
+                }
+            }
+        });
+    }
+}
+
+// ===== 向导逻辑 =====
+window.setWizardStep = function(step) {
+    document.querySelectorAll('.wizard-step').forEach(el => el.classList.remove('active'));
+    document.querySelectorAll('.wizard-dot').forEach(el => el.classList.remove('active'));
+    
+    const stepEl = document.getElementById('wStep' + step);
+    if (stepEl) stepEl.classList.add('active');
+    
+    for (let i = 1; i <= step; i++) {
+        const dot = document.getElementById('dot' + i);
+        if (dot) dot.classList.add('active');
+    }
+};
+
+window.testTeldriveConfig = async function(btn) {
+    const url = document.getElementById('teldriveUrl').value.trim();
+    const token = document.getElementById('teldriveToken').value.trim();
+    
+    if (!url || !token) {
+        showToast('warn', '请填写完整 TelDrive 地址和 Access Token');
+        return;
+    }
+    
+    const origHtml = btn.innerHTML;
+    btn.innerHTML = '<i class="ph ph-spinner ph-spin"></i> 验证中...';
+    btn.disabled = true;
+    
+    try {
+        const resp = await API.saveConfig({ teldrive_url: url, access_token: token });
+        if (resp.success) {
+            const testResp = await API.testConnection();
+            if (testResp.success) {
+                showToast('success', 'TelDrive 连接成功');
+                if (appStatus.aria2_installed) {
+                    setWizardStep(3);
                 } else {
-                    // 仅隐藏配置区，继续诱导安装 Aria2
-                    areaConfig.style.display = 'none';
-                    status.app_configured = true;
+                    setWizardStep(2);
                 }
             } else {
-                showToast('error', res.message || '保存配置失败');
-                btn.disabled = false;
-                btn.textContent = '保存配置并开始';
+                showToast('error', '连接失败: ' + (testResp.message || '未知错误'));
             }
-        } catch(e) {
-            showToast('error', '网络异常');
-            btn.disabled = false;
-            btn.textContent = '保存配置并开始';
+        } else {
+            showToast('error', '保存配置失败: ' + (resp.message || '未知错误'));
         }
-    });
+    } catch (e) {
+        showToast('error', '验证异常: ' + e.message);
+    } finally {
+        btn.innerHTML = origHtml;
+        btn.disabled = false;
+    }
+};
 
-    // 区块 2: Aria2 架构逻辑
-    let selectedArch = 'win-x64';
-    const cards = document.querySelectorAll('.arch-card');
-    cards.forEach(c => {
-        c.addEventListener('click', () => {
-            cards.forEach(x => x.classList.remove('active'));
-            c.classList.add('active');
-            selectedArch = c.dataset.value;
-        });
-    });
+window.installAria2Core = async function() {
+    const btnAuto = document.getElementById('wAria2AutoBtn');
+    const btnUpload = document.getElementById('wAria2UploadBtn');
+    const badge = document.getElementById('wAria2InstallBadge');
+    const text = document.getElementById('wAria2InstallText');
+    const progress = document.getElementById('wAria2InstallProgress');
+    const percent = document.getElementById('wAria2InstallPercent');
+    const btnNext = document.getElementById('wAria2NextBtn');
 
-    const btnInstall = document.getElementById('btnInstallAria2');
-    const progressArea = document.getElementById('installProgressArea');
-    const progressFill = document.getElementById('installProgressFill');
-    const statusText = document.getElementById('installStatusText');
-    const percentText = document.getElementById('installPercentText');
-
-    btnInstall.addEventListener('click', async () => {
-        btnInstall.disabled = true;
-        btnInstall.textContent = '安装进行中...';
-        progressArea.style.display = 'block';
-        progressFill.style.width = '0%';
-        progressFill.className = 'install-progress-bar-fill';
-        statusText.textContent = '正在获取发布信息...';
-        percentText.textContent = '0%';
-
-        // 发起安装请求（后台异步处理，不等完成）
-        const installPromise = API.installAria2(selectedArch);
-
-        // 轮询进度
-        const pollTimer = setInterval(async () => {
-            try {
-                const res = await fetch('/api/system/install-progress').then(r => r.json());
-                if (res.success && res.data) {
-                    const d = res.data;
-                    statusText.textContent = d.message || '处理中...';
-                    let pct = 0;
-                    if (d.status === 'downloading' && d.total > 0) {
-                        pct = Math.min(Math.round((d.downloaded / d.total) * 80), 80);
-                    } else if (d.status === 'extracting') {
-                        pct = 85;
-                    } else if (d.status === 'done') {
-                        pct = 100;
-                    } else if (d.status === 'failed') {
-                        pct = 100;
-                    }
-                    progressFill.style.width = pct + '%';
-                    percentText.textContent = pct + '%';
-
-                    if (d.status === 'done') {
-                        clearInterval(pollTimer);
-                        progressFill.className = 'install-progress-bar-fill done';
-                        statusText.textContent = '✅ ' + d.message;
-                        btnInstall.textContent = '安装完成 - 正在进入系统';
-                        
-                        setTimeout(() => {
-                            if (!status.app_configured) {
-                                btnInstall.textContent = '请先在上方配置存储参数';
-                                btnInstall.disabled = false;
-                                return;
-                            }
-                            document.getElementById('setupWizardModal').style.display = 'none';
-                            initMainApp();
-                        }, 500);
-                    } else if (d.status === 'failed') {
-                        clearInterval(pollTimer);
-                        progressFill.className = 'install-progress-bar-fill failed';
-                        statusText.textContent = '❌ ' + d.message;
-                        btnInstall.disabled = false;
-                        btnInstall.textContent = '重试安装';
-                    }
-                }
-            } catch(e) { /* 忽略轮询错误 */ }
-        }, 500);
-
-        // 等待安装请求完成（如果出错了直接处理）
+    btnAuto.disabled = true;
+    btnUpload.disabled = true;
+    
+    badge.className = 'wizard-status-badge warning';
+    badge.innerHTML = '<i class="ph ph-spinner ph-spin"></i> 下载中';
+    text.textContent = '正在获取最新版核心...';
+    
+    let timer = setInterval(async () => {
         try {
-            const res = await installPromise;
-            if (!res.success) {
-                clearInterval(pollTimer);
-                progressFill.style.width = '100%';
-                progressFill.className = 'install-progress-bar-fill failed';
-                statusText.textContent = '❌ ' + (res.message || '安装失败');
-                btnInstall.disabled = false;
-                btnInstall.textContent = '重试安装';
-            }
-        } catch(e) {
-            clearInterval(pollTimer);
-            progressFill.style.width = '100%';
-            progressFill.className = 'install-progress-bar-fill failed';
-            statusText.textContent = '❌ 网络异常: ' + e.message;
-            btnInstall.disabled = false;
-            btnInstall.textContent = '重试安装';
-        }
-    });
-
-    const btnUpload = document.getElementById('btnUploadAria2');
-    const inputUpload = document.getElementById('uploadAria2Input');
-    btnUpload.addEventListener('click', () => inputUpload.click());
-    inputUpload.addEventListener('change', async (e) => {
-        if(e.target.files.length > 0) {
-            const formData = new FormData();
-            formData.append('file', e.target.files[0]);
-            try {
-                const res = await API.uploadAria2(formData);
-                if(res.success) {
-                    showToast('success', '本地核心上传完毕，子进程已自动启动');
-                    if(status.app_configured) {
-                        document.getElementById('setupWizardModal').style.display = 'none';
-                        initMainApp();
-                    } else {
-                        document.getElementById('setupAria2Area').style.display = 'none';
-                        status.aria2_installed = true;
-                    }
-                } else {
-                    showToast('error', '上传失败: ' + res.message);
+            const pr = await API.getInstallProgress();
+            if (pr.success && pr.data) {
+                text.textContent = pr.data.message || '下载中...';
+                if (pr.data.total > 0) {
+                    const p = Math.round((pr.data.downloaded / pr.data.total) * 100);
+                    progress.style.width = p + '%';
+                    percent.textContent = p + '%';
                 }
-            } catch(err) {
-                showToast('error', '上传错误: ' + err.message);
             }
+        } catch(e) {}
+    }, 1000);
+
+    try {
+        const archSelect = document.getElementById('wAria2ArchSelect');
+        const arch = archSelect ? archSelect.value : 'win-x64';
+        const resp = await API.installAria2(arch);
+        clearInterval(timer);
+        
+        if (resp.success) {
+            badge.className = 'wizard-status-badge success';
+            badge.innerHTML = '<i class="ph ph-check-circle"></i> 安装成功';
+            text.textContent = 'Aria2 核心已就绪';
+            progress.style.width = '100%';
+            percent.textContent = '100%';
+            btnNext.disabled = false;
+            btnAuto.style.display = 'none';
+            btnUpload.style.display = 'none';
+        } else {
+            badge.className = 'wizard-status-badge error';
+            badge.innerHTML = '<i class="ph ph-warning-circle"></i> 下载失败';
+            text.textContent = resp.message || '未知错误';
+            btnAuto.disabled = false;
+            btnUpload.disabled = false;
         }
-    });
-}
+    } catch (e) {
+        clearInterval(timer);
+        badge.className = 'wizard-status-badge error';
+        badge.innerHTML = '<i class="ph ph-warning-circle"></i> 异常';
+        text.textContent = e.message;
+        btnAuto.disabled = false;
+        btnUpload.disabled = false;
+    }
+};
+
+window.saveConfigAndStart = async function(btn) {
+    const localPath = document.getElementById('localPath').value.trim();
+    const maxConcurrent = parseInt(document.getElementById('maxConcurrent').value) || 3;
+    const proxyUrl = document.getElementById('proxyUrl').value.trim();
+    const proxyUser = document.getElementById('proxyUser').value.trim();
+    const proxyPasswd = document.getElementById('proxyPasswd').value.trim();
+    
+    if (!localPath) {
+        showToast('warn', '请填写本地下载保存路径');
+        return;
+    }
+    
+    const origHtml = btn.innerHTML;
+    btn.innerHTML = '<i class="ph ph-spinner ph-spin"></i> 保存中...';
+    btn.disabled = true;
+    
+    try {
+        const url = document.getElementById('teldriveUrl').value.trim();
+        const token = document.getElementById('teldriveToken').value.trim();
+        const resp = await API.saveConfig({ 
+            teldrive_url: url, 
+            access_token: token,
+            local_path: localPath,
+            max_concurrent_downloads: maxConcurrent,
+            proxy_url: proxyUrl,
+            proxy_user: proxyUser,
+            proxy_passwd: proxyPasswd
+        });
+        
+        if (resp.success) {
+            showToast('success', '配置保存成功，系统启动');
+            document.getElementById('setupWizardModal').style.display = 'none';
+            initMainApp(); // 启动主程序
+        } else {
+            showToast('error', '保存配置失败: ' + (resp.message || '未知错误'));
+        }
+    } catch (e) {
+        showToast('error', '保存异常: ' + e.message);
+    } finally {
+        btn.innerHTML = origHtml;
+        btn.disabled = false;
+    }
+};
 
 async function initMainApp() {
     document.querySelectorAll('.nav-item').forEach(btn => {
         btn.addEventListener('click', () => switchPage(btn.dataset.page));
     });
     document.getElementById('btnRefresh').addEventListener('click', refreshTrees);
-    document.getElementById('btnSaveConfig').addEventListener('click', saveConfig);
+    
+    // 代理测试按钮
+    document.getElementById('btnTestProxy')?.addEventListener('click', async () => {
+        // 由于后端暂时没有专用的 test_proxy 接口，这里可以通过触发一次下载或者简单提示（这里以提示代替或调一个可用的测试口）
+        showToast('info', '代理配置已保存。如需测试代理请尝试新建一个下载任务。');
+    });
+
     document.getElementById('btnTestConnection').addEventListener('click', testConnection);
+    
+    // 输入框自动保存绑定
+    const settingInputs = [
+        'inputTeldriveUrl', 'inputAccessToken', 'inputLocalPath', 
+        'inputMaxConcurrent', 'inputProxyUrl', 'inputProxyUser', 'inputProxyPasswd'
+    ];
+    settingInputs.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) {
+            let debounceTimer = null;
+            el.addEventListener('input', () => {
+                clearTimeout(debounceTimer);
+                debounceTimer = setTimeout(() => autoSaveConfig(el), 1000); // 防抖 1 秒
+            });
+            el.addEventListener('change', () => {
+                clearTimeout(debounceTimer);
+                autoSaveConfig(el);
+            });
+        }
+    });
+
+    const rpcListenAll = document.getElementById('inputRpcListenAll');
+    if (rpcListenAll) {
+        rpcListenAll.addEventListener('change', () => autoSaveConfig(rpcListenAll));
+    }
+
+    const rpcSecret = document.getElementById('inputRpcSecret');
+    if (rpcSecret) {
+        rpcSecret.addEventListener('change', () => autoSaveConfig(rpcSecret));
+        rpcSecret.addEventListener('blur', () => autoSaveConfig(rpcSecret));
+    }
     
     // 顶部操作栏事件
     document.getElementById('btnResumeAll')?.addEventListener('click', async () => { await API.resumeAll(); showToast('success', '已发送全部恢复请求'); pollDownloadStatus(); });
@@ -279,6 +430,7 @@ async function loadConfig() {
         const resp = await API.getConfig();
         if (resp.success && resp.data) {
             const c = resp.data;
+            lastSavedConfig = { ...c };
             document.getElementById('inputTeldriveUrl').value = c.teldrive_url || '';
             document.getElementById('inputAccessToken').value = c.access_token || '';
             document.getElementById('inputLocalPath').value = c.local_path || '';
@@ -286,6 +438,8 @@ async function loadConfig() {
             document.getElementById('inputProxyUrl').value = c.proxy_url || '';
             document.getElementById('inputProxyUser').value = c.proxy_user || '';
             document.getElementById('inputProxyPasswd').value = c.proxy_passwd || '';
+            document.getElementById('inputRpcListenAll').checked = !!c.rpc_allow_remote;
+            document.getElementById('inputRpcSecret').value = c.rpc_secret || '';
             if (c.teldrive_url && c.access_token) setConnectionStatus(true);
 
             const treesResp = await API.getTrees();
@@ -302,24 +456,49 @@ async function loadConfig() {
     } catch (e) { console.error('加载配置失败:', e); }
 }
 
-async function saveConfig() {
-    const btn = document.getElementById('btnSaveConfig');
-    btn.classList.add('loading'); btn.disabled = true;
+async function autoSaveConfig(el) {
+    const rpcSecretInput = document.getElementById('inputRpcSecret');
+    const shouldUseLiveRpcSecret = el && (el.id === 'inputRpcSecret' || el.id === 'inputRpcListenAll');
+    const rpcSecret = shouldUseLiveRpcSecret
+        ? (rpcSecretInput?.value.trim() || '')
+        : (lastSavedConfig.rpc_secret || '');
+
+    const data = {
+        teldrive_url: document.getElementById('inputTeldriveUrl').value.trim(),
+        access_token: document.getElementById('inputAccessToken').value.trim(),
+        local_path: document.getElementById('inputLocalPath').value.trim(),
+        max_concurrent_downloads: parseInt(document.getElementById('inputMaxConcurrent').value) || 2,
+        proxy_url: document.getElementById('inputProxyUrl').value.trim(),
+        proxy_user: document.getElementById('inputProxyUser').value.trim(),
+        proxy_passwd: document.getElementById('inputProxyPasswd').value.trim(),
+        rpc_allow_remote: document.getElementById('inputRpcListenAll').checked,
+        rpc_secret: rpcSecret,
+    };
+    
     try {
-        const data = {
-            teldrive_url: document.getElementById('inputTeldriveUrl').value.trim(),
-            access_token: document.getElementById('inputAccessToken').value.trim(),
-            local_path: document.getElementById('inputLocalPath').value.trim(),
-            max_concurrent_downloads: parseInt(document.getElementById('inputMaxConcurrent').value) || 2,
-            proxy_url: document.getElementById('inputProxyUrl').value.trim(),
-            proxy_user: document.getElementById('inputProxyUser').value.trim(),
-            proxy_passwd: document.getElementById('inputProxyPasswd').value.trim(),
-        };
         const resp = await API.saveConfig(data);
-        if (resp.success) { showToast('success', '配置已保存'); setConnectionStatus(true); }
-        else showToast('error', resp.message || '保存失败');
-    } catch (e) { showToast('error', '保存失败: ' + e.message); }
-    finally { btn.classList.remove('loading'); btn.disabled = false; }
+        if (resp.success) {
+            lastSavedConfig = { ...lastSavedConfig, ...data };
+
+            if (el && el.parentElement) {
+                const icon = el.parentElement.querySelector('.save-icon');
+                if (icon) {
+                    icon.classList.add('show');
+                    setTimeout(() => icon.classList.remove('show'), 2000);
+                }
+            }
+            if (data.teldrive_url && data.access_token) {
+                setConnectionStatus(true);
+            }
+            if (el && (el.id === 'inputRpcListenAll' || el.id === 'inputRpcSecret') && resp.data) {
+                showToast('success', resp.data);
+            }
+        } else {
+            showToast('error', resp.message || '自动保存失败');
+        }
+    } catch (e) {
+        showToast('error', '自动保存失败: ' + e.message);
+    }
 }
 
 async function testConnection() {
@@ -328,11 +507,9 @@ async function testConnection() {
     btn.classList.add('loading'); btn.disabled = true;
     result.className = 'test-result'; result.style.display = 'none';
     try {
-        await API.saveConfig({
-            teldrive_url: document.getElementById('inputTeldriveUrl').value.trim(),
-            access_token: document.getElementById('inputAccessToken').value.trim(),
-            local_path: document.getElementById('inputLocalPath').value.trim(),
-        });
+        // 先确保是最新的保存状态
+        await autoSaveConfig(document.getElementById('inputTeldriveUrl'));
+        
         const resp = await API.testConnection();
         if (resp.success) {
             result.className = 'test-result success';

@@ -30,11 +30,12 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: AppConfig, rpc_port: u16) -> Arc<Self> {
+        let rpc_secret = config.rpc_secret.clone();
         Arc::new(Self {
             config: RwLock::new(config),
             remote_tree: RwLock::new(None),
             local_tree: RwLock::new(None),
-            aria2_client: Aria2Client::new(rpc_port),
+            aria2_client: Aria2Client::new(rpc_port, rpc_secret),
         })
     }
 }

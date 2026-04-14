@@ -5,13 +5,14 @@ use crate::teldrive::TelDriveClient;
 use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
 use axum::response::Json;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{copy, Write};
 use std::path::Path;
 use std::sync::Arc;
-use tracing::{error, info};
+use std::time::Duration;
+use tracing::{error, info, warn};
 
 #[derive(Deserialize)]
 pub struct ConfigUpdate {
@@ -22,6 +23,8 @@ pub struct ConfigUpdate {
     pub proxy_url: Option<String>,
     pub proxy_user: Option<String>,
     pub proxy_passwd: Option<String>,
+    pub rpc_allow_remote: Option<bool>,
+    pub rpc_secret: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -50,6 +53,172 @@ pub fn err_response<T: Serialize>(msg: &str) -> (StatusCode, Json<ApiResponse<T>
     )
 }
 
+fn normalize_proxy_url(raw: &str) -> Result<String, String> {
+    let proxy_url = raw.trim();
+    if proxy_url.is_empty() {
+        return Ok(String::new());
+    }
+
+    let parsed = Url::parse(proxy_url).map_err(|_| {
+        "代理地址格式不正确，请使用 http(s)://host:port 或 socks5://host:port".to_string()
+    })?;
+
+    match parsed.scheme() {
+        "http" | "https" | "socks5" | "socks5h" => {}
+        _ => return Err("代理地址协议仅支持 http、https、socks5、socks5h".to_string()),
+    }
+
+    if parsed.host_str().is_none() {
+        return Err("代理地址缺少主机名".to_string());
+    }
+
+    if !parsed.path().is_empty() && parsed.path() != "/" {
+        return Err("代理地址不应包含路径，请只填写协议、主机和端口".to_string());
+    }
+
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("代理地址不应包含查询参数或片段".to_string());
+    }
+
+    Ok(proxy_url.to_string())
+}
+
+fn build_aria2_global_options(config: &AppConfig) -> serde_json::Value {
+    let mut options = serde_json::Map::new();
+    options.insert(
+        "max-concurrent-downloads".to_string(),
+        serde_json::json!(config.max_concurrent_downloads.to_string()),
+    );
+    options.insert("all-proxy".to_string(), serde_json::json!(config.proxy_url));
+    options.insert(
+        "all-proxy-user".to_string(),
+        serde_json::json!(config.proxy_user),
+    );
+    options.insert(
+        "all-proxy-passwd".to_string(),
+        serde_json::json!(config.proxy_passwd),
+    );
+    serde_json::Value::Object(options)
+}
+
+fn build_save_message(base: &str, config: &AppConfig) -> String {
+    if config.rpc_allow_remote && config.rpc_secret.is_empty() {
+        format!("{}（已允许外部访问，建议设置 RPC 密码）", base)
+    } else {
+        base.to_string()
+    }
+}
+
+fn spawn_aria2_from_config(config: &AppConfig) -> Result<(), String> {
+    let local_path = if config.local_path.is_empty() {
+        "."
+    } else {
+        &config.local_path
+    };
+
+    crate::aria2::spawn_aria2(
+        local_path,
+        16800,
+        config.max_concurrent_downloads,
+        &config.proxy_url,
+        &config.proxy_user,
+        &config.proxy_passwd,
+        config.rpc_allow_remote,
+        &config.rpc_secret,
+    )
+}
+
+async fn restart_aria2_with_config(state: &Arc<AppState>, config: &AppConfig) -> String {
+    if !crate::aria2::check_aria2_exists() {
+        state.aria2_client.set_secret(config.rpc_secret.clone()).await;
+        return build_save_message("配置已保存，Aria2 安装后会按新的 RPC 设置启动", config);
+    }
+
+    if let Err(e) = state.aria2_client.force_shutdown().await {
+        warn!("尝试关闭旧的 Aria2 进程失败，继续尝试重启: {}", e);
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    match spawn_aria2_from_config(config) {
+        Ok(_) => {
+            state.aria2_client.set_secret(config.rpc_secret.clone()).await;
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            match state
+                .aria2_client
+                .change_global_option(build_aria2_global_options(config))
+                .await
+            {
+                Ok(_) => build_save_message("配置已保存，Aria2 已重启并应用新的 RPC 设置", config),
+                Err(e) => {
+                    warn!("Aria2 重启成功，但补充应用运行时配置失败: {}", e);
+                    build_save_message("配置已保存，Aria2 已按新的 RPC 设置重启", config)
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Aria2 重启失败，新配置将在下次启动时加载: {}", e);
+            build_save_message("配置已保存，但当前未能重启 Aria2；下次启动后会按新 RPC 设置加载", config)
+        }
+    }
+}
+
+async fn apply_aria2_config(
+    state: &Arc<AppState>,
+    config: &AppConfig,
+    restart_required: bool,
+) -> String {
+    if restart_required {
+        return restart_aria2_with_config(state, config).await;
+    }
+
+    let options = build_aria2_global_options(config);
+
+    match state.aria2_client.change_global_option(options.clone()).await {
+        Ok(_) => build_save_message("配置已保存并已应用到 Aria2", config),
+        Err(apply_err) => {
+            if !crate::aria2::check_aria2_exists() {
+                warn!("Aria2 未就绪，配置已保存，等待后续启动自动加载: {}", apply_err);
+                state.aria2_client.set_secret(config.rpc_secret.clone()).await;
+                return build_save_message("配置已保存，Aria2 启动后会自动加载", config);
+            }
+
+            match spawn_aria2_from_config(config) {
+                Ok(_) => {
+                    state.aria2_client.set_secret(config.rpc_secret.clone()).await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    match state
+                        .aria2_client
+                        .change_global_option(build_aria2_global_options(config))
+                        .await
+                    {
+                        Ok(_) => build_save_message("配置已保存，Aria2 已重连并应用", config),
+                        Err(retry_err) => {
+                            warn!(
+                                "Aria2 已尝试重连，但仍未能应用最新配置: {}; 初始错误: {}",
+                                retry_err, apply_err
+                            );
+                            build_save_message(
+                                "配置已保存，但当前未能连接 Aria2；下次启动后会自动加载",
+                                config,
+                            )
+                        }
+                    }
+                }
+                Err(spawn_err) => {
+                    warn!(
+                        "Aria2 配置未实时应用，已保存等待下次启动: {}; 启动失败: {}",
+                        apply_err, spawn_err
+                    );
+                    build_save_message(
+                        "配置已保存，但当前未能连接 Aria2；下次启动后会自动加载",
+                        config,
+                    )
+                }
+            }
+        }
+    }
+}
+
 /// GET /api/config
 pub async fn get_config(State(state): State<Arc<AppState>>) -> Json<ApiResponse<AppConfig>> {
     let config = state.config.read().await.clone();
@@ -62,14 +231,17 @@ pub async fn save_config(
     Json(update): Json<ConfigUpdate>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
     let mut config = state.config.write().await;
+    let previous_config = config.clone();
+
     if let Some(url) = update.teldrive_url {
         config.teldrive_url = url.trim_end_matches('/').to_string();
     }
     if let Some(token) = update.access_token {
-        config.access_token = token;
+        config.access_token = token.trim().to_string();
     }
     if let Some(path) = update.local_path {
         config.local_path = path
+            .trim()
             .trim_end_matches('\\')
             .trim_end_matches('/')
             .to_string();
@@ -78,37 +250,30 @@ pub async fn save_config(
         config.max_concurrent_downloads = max.clamp(1, 5);
     }
     if let Some(proxy_url) = update.proxy_url {
-        config.proxy_url = proxy_url;
+        config.proxy_url = normalize_proxy_url(&proxy_url).map_err(|e| err_response::<String>(&e))?;
     }
     if let Some(proxy_user) = update.proxy_user {
-        config.proxy_user = proxy_user;
+        config.proxy_user = proxy_user.trim().to_string();
     }
     if let Some(proxy_passwd) = update.proxy_passwd {
-        config.proxy_passwd = proxy_passwd;
+        config.proxy_passwd = proxy_passwd.trim().to_string();
+    }
+    if let Some(rpc_allow_remote) = update.rpc_allow_remote {
+        config.rpc_allow_remote = rpc_allow_remote;
+    }
+    if let Some(rpc_secret) = update.rpc_secret {
+        config.rpc_secret = rpc_secret.trim().to_string();
     }
     config.save().map_err(|e| err_response::<String>(&e))?;
-    
-    // 实时生效 Aria2 配置
-    let mut options = serde_json::Map::new();
-    options.insert(
-        "max-concurrent-downloads".to_string(),
-        serde_json::json!(config.max_concurrent_downloads.to_string()),
-    );
-    options.insert(
-        "all-proxy".to_string(),
-        serde_json::json!(config.proxy_url),
-    );
-    options.insert(
-        "all-proxy-user".to_string(),
-        serde_json::json!(config.proxy_user),
-    );
-    options.insert(
-        "all-proxy-passwd".to_string(),
-        serde_json::json!(config.proxy_passwd),
-    );
-    let _ = state.aria2_client.change_global_option(serde_json::Value::Object(options)).await;
 
-    Ok(ok_response("配置已保存并生效".to_string()))
+    let restart_required = previous_config.rpc_allow_remote != config.rpc_allow_remote
+        || previous_config.rpc_secret != config.rpc_secret;
+
+    let config_snapshot = config.clone();
+    drop(config);
+
+    let message = apply_aria2_config(&state, &config_snapshot, restart_required).await;
+    Ok(ok_response(message))
 }
 
 /// POST /api/test-connection
@@ -825,10 +990,10 @@ pub async fn install_aria2(
     
     // 自动触发启动
     let config = state.config.read().await;
-    let local_path = if config.local_path.is_empty() { "." } else { &config.local_path };
-    if let Err(e) = crate::aria2::spawn_aria2(local_path, 16800, config.max_concurrent_downloads, &config.proxy_url, &config.proxy_user, &config.proxy_passwd) {
+    if let Err(e) = spawn_aria2_from_config(&config) {
         tracing::error!("Aria2 提取成功但自动启动失败: {}", e);
     } else {
+        state.aria2_client.set_secret(config.rpc_secret.clone()).await;
         info!("Aria2 安装后自动启动成功");
     }
 
@@ -857,10 +1022,10 @@ pub async fn upload_aria2(
 
             // 自动触发启动
             let config = state.config.read().await;
-            let local_path = if config.local_path.is_empty() { "." } else { &config.local_path };
-            if let Err(e) = crate::aria2::spawn_aria2(local_path, 16800, config.max_concurrent_downloads, &config.proxy_url, &config.proxy_user, &config.proxy_passwd) {
+            if let Err(e) = spawn_aria2_from_config(&config) {
                 tracing::error!("Aria2 上传成功但自动启动失败: {}", e);
             } else {
+                state.aria2_client.set_secret(config.rpc_secret.clone()).await;
                 info!("Aria2 上传后自动启动成功");
             }
 

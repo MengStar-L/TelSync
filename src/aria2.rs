@@ -1,28 +1,43 @@
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
+use sysinfo::System;
 use tokio::process::Command;
-use tracing::info;
+use tokio::sync::RwLock;
+use tracing::{info, warn};
 
 #[derive(Clone)]
 pub struct Aria2Client {
     client: Client,
     rpc_url: String,
+    rpc_secret: Arc<RwLock<String>>,
 }
 
 impl Aria2Client {
-    pub fn new(port: u16) -> Self {
+    pub fn new(port: u16, rpc_secret: String) -> Self {
         Self {
             client: Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap(),
             rpc_url: format!("http://localhost:{}/jsonrpc", port),
+            rpc_secret: Arc::new(RwLock::new(rpc_secret)),
         }
     }
 
-    async fn call(&self, method: &str, params: Vec<Value>) -> Result<Value, String> {
+    pub async fn set_secret(&self, rpc_secret: String) {
+        *self.rpc_secret.write().await = rpc_secret;
+    }
+
+    async fn call(&self, method: &str, mut params: Vec<Value>) -> Result<Value, String> {
+        let rpc_secret = self.rpc_secret.read().await.clone();
+        if !rpc_secret.is_empty() {
+            params.insert(0, json!(format!("token:{}", rpc_secret)));
+        }
+
         let req_body = json!({
             "jsonrpc": "2.0",
             "id": "telsync",
@@ -151,34 +166,119 @@ impl Aria2Client {
     pub async fn change_global_option(&self, options: serde_json::Value) -> Result<Value, String> {
         self.call("aria2.changeGlobalOption", vec![options]).await
     }
+
+    pub async fn force_shutdown(&self) -> Result<(), String> {
+        self.call("aria2.forceShutdown", vec![]).await.map(|_| ())
+    }
+}
+
+fn aria2_binary_path() -> PathBuf {
+    let file_name = if cfg!(windows) { "aria2c.exe" } else { "aria2c" };
+
+    if let Ok(current_dir) = std::env::current_dir() {
+        let candidate = current_dir.join(file_name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    if let Ok(current_exe) = std::env::current_exe() {
+        if let Some(dir) = current_exe.parent() {
+            let candidate = dir.join(file_name);
+            if candidate.exists() {
+                return candidate;
+            }
+        }
+    }
+
+    PathBuf::from(file_name)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = normalize_path(left);
+    let right = normalize_path(right);
+
+    if cfg!(windows) {
+        left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
+}
+
+fn cleanup_managed_aria2_processes(port: u16, aria2_path: &Path) {
+    let target_path = normalize_path(aria2_path);
+    let mut system = System::new_all();
+    system.refresh_all();
+
+    let mut killed = 0;
+    let port_flag = format!("--rpc-listen-port={}", port);
+
+    for process in system.processes().values() {
+        let cmd = process
+            .cmd()
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let port_matches = cmd.contains(&port_flag);
+        let exe_matches = process
+            .exe()
+            .map(|exe| same_path(exe, &target_path))
+            .unwrap_or(false);
+        let looks_like_aria2 = process
+            .name()
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .contains("aria2");
+
+        if (exe_matches && (port_matches || cmd.contains("--enable-rpc=true")))
+            || (port_matches && looks_like_aria2)
+        {
+            if process.kill() {
+                killed += 1;
+            } else {
+                warn!("未能终止旧的 aria2 进程: {:?}", process.name());
+            }
+        }
+    }
+
+    if killed > 0 {
+        info!("已清理 {} 个旧的 Aria2 进程", killed);
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 pub fn check_aria2_exists() -> bool {
-    let aria2_exe = if cfg!(windows) {
-        "aria2c.exe"
-    } else {
-        "./aria2c"
-    };
-    std::path::Path::new(aria2_exe).exists()
+    aria2_binary_path().exists()
 }
 
-pub fn spawn_aria2(local_dir: &str, port: u16, max_concurrent: usize, proxy_url: &str, proxy_user: &str, proxy_passwd: &str) -> Result<(), String> {
-    let aria2_exe = if cfg!(windows) {
-        ".\\aria2c.exe"
-    } else {
-        "./aria2c"
-    };
+pub fn spawn_aria2(
+    local_dir: &str,
+    port: u16,
+    max_concurrent: usize,
+    proxy_url: &str,
+    proxy_user: &str,
+    proxy_passwd: &str,
+    rpc_allow_remote: bool,
+    rpc_secret: &str,
+) -> Result<(), String> {
+    let aria2_exe = aria2_binary_path();
 
-    if !std::path::Path::new(aria2_exe).exists() {
+    if !aria2_exe.exists() {
         return Err("未找到 Aria2".to_string());
     }
 
+    cleanup_managed_aria2_processes(port, &aria2_exe);
+
     info!("启动 Aria2 进程 (端口 {})...", port);
-    // 使用 Command 启动子进程，并将输出放入 null 以避免污染日志
-    let mut cmd = Command::new(aria2_exe);
+    let mut cmd = Command::new(&aria2_exe);
     cmd.arg("--enable-rpc=true")
         .arg(format!("--rpc-listen-port={}", port))
-        .arg("--rpc-listen-all=false")
+        .arg(format!("--rpc-listen-all={}", rpc_allow_remote))
         .arg("--rpc-allow-origin-all=true")
         .arg(format!("--max-concurrent-downloads={}", max_concurrent))
         .arg("--continue=true")
@@ -186,7 +286,10 @@ pub fn spawn_aria2(local_dir: &str, port: u16, max_concurrent: usize, proxy_url:
         .arg("--allow-overwrite=false")
         .arg(format!("--dir={}", local_dir));
 
-    // 代理配置
+    if !rpc_secret.is_empty() {
+        cmd.arg(format!("--rpc-secret={}", rpc_secret));
+    }
+
     if !proxy_url.is_empty() {
         cmd.arg(format!("--all-proxy={}", proxy_url));
         if !proxy_user.is_empty() {
@@ -198,16 +301,28 @@ pub fn spawn_aria2(local_dir: &str, port: u16, max_concurrent: usize, proxy_url:
         info!("Aria2 代理已配置: {}", proxy_url);
     }
 
-    let child = cmd
+    if rpc_allow_remote {
+        info!("Aria2 RPC 已允许外部访问");
+    }
+    if !rpc_secret.is_empty() {
+        info!("Aria2 RPC 密码已配置");
+    }
+
+    let mut child = cmd
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("无法启动 aria2: {}", e))?;
 
+    std::thread::sleep(Duration::from_millis(200));
+    if let Some(status) = child
+        .try_wait()
+        .map_err(|e| format!("检查 aria2 启动状态失败: {}", e))?
+    {
+        return Err(format!("Aria2 启动后立即退出: {}", status));
+    }
 
-    // 监控意外退出
-    let mut child = child;
     tokio::spawn(async move {
         match child.wait().await {
             Ok(status) => tracing::error!("Aria2 进程已退出, 状态码: {}", status),

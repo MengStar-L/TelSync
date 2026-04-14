@@ -22,6 +22,12 @@ pub struct AppConfig {
     /// Aria2 代理密码 (all-proxy-passwd)
     #[serde(default)]
     pub proxy_passwd: String,
+    /// 是否允许外部设备访问 Aria2 RPC
+    #[serde(default)]
+    pub rpc_allow_remote: bool,
+    /// Aria2 RPC 密码 (rpc-secret)
+    #[serde(default)]
+    pub rpc_secret: String,
 }
 
 impl Default for AppConfig {
@@ -34,6 +40,8 @@ impl Default for AppConfig {
             proxy_url: String::new(),
             proxy_user: String::new(),
             proxy_passwd: String::new(),
+            rpc_allow_remote: false,
+            rpc_secret: String::new(),
         }
     }
 }
