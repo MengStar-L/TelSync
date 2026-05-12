@@ -4,13 +4,16 @@ mod aria2;
 mod scanner;
 mod state;
 mod teldrive;
+mod tree_cache;
+mod tree_sync;
 
 use axum::http::header;
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::Router;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{info, warn};
 
 const STATIC_HTML: &str = include_str!("../static/index.html");
 const STATIC_CSS: &str = include_str!("../static/style.css");
@@ -50,6 +53,17 @@ async fn main() {
     }
 
     let app_state = state::AppState::new(config, rpc_port);
+    let scheduled_refresh_state = app_state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(e) = tree_sync::refresh_and_store(&scheduled_refresh_state, "scheduled").await {
+                warn!("后台定时刷新文件树失败: {}", e);
+            }
+        }
+    });
 
     // 构建路由
     let app = Router::new()
@@ -61,7 +75,9 @@ async fn main() {
         .route("/api/config", get(api::get_config).post(api::save_config))
         .route("/api/test-connection", post(api::test_connection))
         .route("/api/trees", get(api::get_trees))
+        .route("/api/trees/initial", post(api::initial_trees))
         .route("/api/trees/refresh", post(api::refresh_trees))
+        .route("/api/trees/events", get(api::tree_events))
         .route("/api/download/enqueue", post(api::enqueue_download))
         .route("/api/download/delete", post(api::delete_local_file))
         .route("/api/download/status", get(api::download_status))

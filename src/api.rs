@@ -1,12 +1,15 @@
 use crate::config::AppConfig;
-use crate::scanner::{mark_local_existence, scan_local_dir};
 use crate::state::{AppState, FileNode};
+use crate::tree_sync::{self, TreeRefreshEvent, TreeSnapshot};
 use crate::teldrive::TelDriveClient;
 use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Json;
+use futures_util::stream;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::fs::File;
 use std::io::{copy, Write};
 use std::path::Path;
@@ -296,36 +299,88 @@ pub async fn test_connection(
 pub struct TreeResponse {
     pub remote: Vec<FileNode>,
     pub local: Vec<FileNode>,
+    pub refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub from_cache: bool,
 }
 
 pub async fn get_trees(State(state): State<Arc<AppState>>) -> Json<ApiResponse<TreeResponse>> {
-    let remote = state.remote_tree.read().await.clone().unwrap_or_default();
-    let local = state.local_tree.read().await.clone().unwrap_or_default();
-    ok_response(TreeResponse { remote, local })
+    ok_response(tree_response_from_snapshot(tree_sync::current_snapshot(&state).await))
 }
 
 pub async fn refresh_trees(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<TreeResponse>>, (StatusCode, Json<ApiResponse<TreeResponse>>)> {
-    let config = state.config.read().await.clone();
-    if !config.is_configured() {
-        return Err(err_response("请先完成配置"));
-    }
-    let client = TelDriveClient::new(&config.teldrive_url, &config.access_token);
-    let mut remote_tree = client
-        .fetch_tree("/")
+    let snapshot = tree_sync::refresh_and_store(&state, "manual")
         .await
         .map_err(|e| err_response::<TreeResponse>(&e))?;
-    let local_tree =
-        scan_local_dir(&config.local_path).map_err(|e| err_response::<TreeResponse>(&e))?;
-    mark_local_existence(&mut remote_tree, &local_tree);
-    *state.remote_tree.write().await = Some(remote_tree.clone());
-    *state.local_tree.write().await = Some(local_tree.clone());
-    info!("文件树已刷新");
-    Ok(ok_response(TreeResponse {
-        remote: remote_tree,
-        local: local_tree,
-    }))
+    Ok(ok_response(tree_response_from_snapshot(snapshot)))
+}
+
+pub async fn initial_trees(State(state): State<Arc<AppState>>) -> Json<ApiResponse<TreeResponse>> {
+    match tree_sync::refresh_and_store(&state, "startup").await {
+        Ok(snapshot) => ok_response(tree_response_from_snapshot(snapshot)),
+        Err(e) => {
+            warn!("页面首次刷新失败，回退到缓存快照: {}", e);
+            let snapshot = tree_sync::current_snapshot(&state).await;
+            Json(ApiResponse {
+                success: true,
+                data: Some(tree_response_from_snapshot(snapshot)),
+                message: Some("实时刷新失败，已显示上次缓存".to_string()),
+            })
+        }
+    }
+}
+
+pub async fn tree_events(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.tree_events.subscribe();
+    let stream = stream::unfold(rx, |mut rx| async move {
+        loop {
+            match rx.recv().await {
+                Ok(TreeRefreshEvent {
+                    refreshed_at,
+                    source,
+                }) => {
+                    let data = serde_json::json!({
+                        "refreshed_at": refreshed_at,
+                        "source": source,
+                    });
+                    let event = Event::default()
+                        .event("trees_refreshed")
+                        .data(data.to_string());
+                    return Some((Ok(event), rx));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+fn tree_response_from_snapshot(snapshot: TreeSnapshot) -> TreeResponse {
+    TreeResponse {
+        remote: snapshot.remote,
+        local: snapshot.local,
+        refreshed_at: snapshot.refreshed_at,
+        from_cache: snapshot.from_cache,
+    }
+}
+
+async fn refresh_local_tree_cache_if_possible(state: &Arc<AppState>, local_path: &str, source: &str) {
+    if local_path.is_empty() {
+        return;
+    }
+    match crate::scanner::scan_local_dir(local_path) {
+        Ok(local_tree) => {
+            if let Err(e) = tree_sync::update_local_and_store(state, local_tree, source).await {
+                warn!("持久化本地文件树快照失败: {}", e);
+            }
+        }
+        Err(e) => warn!("刷新本地文件树缓存失败: {}", e),
+    }
 }
 
 pub fn find_node<'a>(nodes: &'a [FileNode], path: &str) -> Option<&'a FileNode> {
@@ -485,14 +540,7 @@ pub async fn delete_local_file(
         }
     }
 
-    // 触发刷新本地文件树以更新状态
-    if let Ok(local_tree) = crate::scanner::scan_local_dir(&config.local_path) {
-        let mut remote_tree_guard = state.remote_tree.write().await;
-        if let Some(remote_tree) = remote_tree_guard.as_mut() {
-            crate::scanner::mark_local_existence(remote_tree, &local_tree);
-        }
-        *state.local_tree.write().await = Some(local_tree);
-    }
+    refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
 
     Ok(ok_response("删除成功".to_string()))
 }
@@ -650,14 +698,7 @@ pub async fn cancel_download(
         }
     }
 
-    // 刷新本地文件树缓存
-    if let Ok(local_tree) = crate::scanner::scan_local_dir(&config.local_path) {
-        let mut remote_tree_guard = state.remote_tree.write().await;
-        if let Some(remote_tree) = remote_tree_guard.as_mut() {
-            crate::scanner::mark_local_existence(remote_tree, &local_tree);
-        }
-        *state.local_tree.write().await = Some(local_tree);
-    }
+    refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
 
     ok_response("已取消并清理文件".to_string())
 }

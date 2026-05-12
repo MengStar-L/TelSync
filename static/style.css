@@ -238,6 +238,13 @@ body {
     font-size: 0.82rem; font-weight: 600;
 }
 
+.tree-refresh-time {
+    margin-left: 4px;
+    font-size: 0.7rem;
+    font-weight: 500;
+    color: var(--text-muted);
+}
+
 .panel-stats {
     display: flex; gap: 8px; align-items: center;
     margin-bottom: 2px;

@@ -7,6 +7,7 @@ const API = {
     saveConfig: (data) => fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) }).then(r => r.json()),
     testConnection: () => fetch('/api/test-connection', { method: 'POST' }).then(r => r.json()),
     getTrees: () => fetch('/api/trees').then(r => r.json()),
+    initialTrees: () => fetch('/api/trees/initial', { method: 'POST' }).then(r => r.json()),
     refreshTrees: () => fetch('/api/trees/refresh', { method: 'POST' }).then(r => r.json()),
     enqueueDownload: (path) => fetch('/api/download/enqueue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) }).then(r => r.json()),
     deleteLocalFile: (path) => fetch('/api/download/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) }).then(r => r.json()),
@@ -38,6 +39,7 @@ let cachedRemoteNodes = [];
 let cachedLocalNodes = [];
 let treeRendered = false; 
 let lastSavedConfig = {};
+let treeEvents = null;
 
 // ===== 初始化 =====
 let appStatus = {};
@@ -412,7 +414,7 @@ async function initMainApp() {
 
     await loadConfig();
     startDownloadPolling();
-    setInterval(silentRefreshTrees, 5 * 60 * 1000); // 每5分钟静默刷新对齐后端
+    connectTreeEvents();
 }
 
 // ===== 页面切换 =====
@@ -442,18 +444,27 @@ async function loadConfig() {
             document.getElementById('inputRpcSecret').value = c.rpc_secret || '';
             if (c.teldrive_url && c.access_token) setConnectionStatus(true);
 
-            const treesResp = await API.getTrees();
-            if (treesResp.success && treesResp.data) {
-                cachedRemoteNodes = treesResp.data.remote || [];
-                cachedLocalNodes = treesResp.data.local || [];
-                if (cachedRemoteNodes.length > 0) {
-                    renderRemoteTree(cachedRemoteNodes);
-                    renderLocalTree(cachedLocalNodes);
-                    treeRendered = true;
-                }
-            }
+            await loadTreesOnStartup();
         }
     } catch (e) { console.error('加载配置失败:', e); }
+}
+
+async function loadTreesOnStartup() {
+    try {
+        const resp = await API.initialTrees();
+        if (resp.success && resp.data) {
+            applyTreeResponse(resp.data);
+            if (resp.message) {
+                showToast('warn', resp.message);
+            }
+        }
+    } catch (e) {
+        console.error('首次加载文件树失败:', e);
+        const resp = await API.getTrees();
+        if (resp.success && resp.data) {
+            applyTreeResponse(resp.data);
+        }
+    }
 }
 
 async function autoSaveConfig(el) {
@@ -541,15 +552,53 @@ async function refreshTrees() {
     try {
         const resp = await API.refreshTrees();
         if (resp.success && resp.data) {
-            cachedRemoteNodes = resp.data.remote || [];
-            cachedLocalNodes = resp.data.local || [];
-            renderRemoteTree(cachedRemoteNodes);
-            renderLocalTree(cachedLocalNodes);
-            treeRendered = true;
+            applyTreeResponse(resp.data);
             showToast('success', '文件树已刷新');
         } else { showToast('error', resp.message || '刷新失败'); }
     } catch (e) { showToast('error', '刷新失败: ' + e.message); }
     finally { btn.classList.remove('loading'); isRefreshing = false; }
+}
+
+function applyTreeResponse(data) {
+    cachedRemoteNodes = data.remote || [];
+    cachedLocalNodes = data.local || [];
+    updateTreeRefreshTime(data.refreshed_at);
+    renderRemoteTree(cachedRemoteNodes);
+    renderLocalTree(cachedLocalNodes);
+    treeRendered = true;
+}
+
+function updateTreeRefreshTime(refreshedAt) {
+    const el = document.getElementById('treeRefreshTime');
+    if (!el) return;
+    if (!refreshedAt) {
+        el.textContent = '上次刷新：--';
+        return;
+    }
+    const date = new Date(refreshedAt);
+    if (Number.isNaN(date.getTime())) {
+        el.textContent = '上次刷新：--';
+        return;
+    }
+    el.textContent = `上次刷新：${formatLocalDateTime(date)}`;
+}
+
+function formatLocalDateTime(date) {
+    const pad = (value) => String(value).padStart(2, '0');
+    return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+function connectTreeEvents() {
+    if (treeEvents) {
+        treeEvents.close();
+    }
+    treeEvents = new EventSource('/api/trees/events');
+    treeEvents.addEventListener('trees_refreshed', async () => {
+        await silentRefreshTrees();
+    });
+    treeEvents.onerror = () => {
+        console.warn('文件树同步通道已断开，等待自动重连');
+    };
 }
 
 function renderRemoteTree(nodes) {
@@ -1114,12 +1163,9 @@ async function pollDownloadStatus() {
 // 静默刷新文件树（不显示 toast，不影响 UI）
 async function silentRefreshTrees() {
     try {
-        const resp = await API.refreshTrees();
+        const resp = await API.getTrees();
         if (resp.success && resp.data) {
-            cachedRemoteNodes = resp.data.remote || [];
-            cachedLocalNodes = resp.data.local || [];
-            renderRemoteTree(cachedRemoteNodes);
-            renderLocalTree(cachedLocalNodes);
+            applyTreeResponse(resp.data);
             // 重建 DOM 后立即补刷进度覆盖，防止按钮/百分比在两次轮询间跳动
             const dlMap = buildDownloadMap();
             updateRemoteTreeProgress(dlMap);
