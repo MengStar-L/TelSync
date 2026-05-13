@@ -13,12 +13,14 @@ const API = {
     deleteLocalFile: (path) => fetch('/api/download/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path }) }).then(r => r.json()),
     downloadStatus: () => fetch('/api/download/status').then(r => r.json()),
     cancelDownload: (taskId) => fetch('/api/download/cancel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ task_id: taskId }) }).then(r => r.json()),
+    removeDownload: (taskId) => fetch('/api/download/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ task_id: taskId }) }).then(r => r.json()),
     retryDownload: (taskId) => fetch('/api/download/retry', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ task_id: taskId }) }).then(r => r.json()),
     pauseAll: () => fetch('/api/download/pause-all', { method: 'POST' }).then(r => r.json()),
     resumeAll: () => fetch('/api/download/resume-all', { method: 'POST' }).then(r => r.json()),
     clearFailed: () => fetch('/api/download/clear-failed', { method: 'POST' }).then(r => r.json()),
     clearAll: () => fetch('/api/download/clear-all', { method: 'POST' }).then(r => r.json()),
     getInitStatus: () => fetch('/api/system/init-status').then(r => r.json()),
+    getUpdateInfo: () => fetch('/api/system/update-info').then(r => r.json()),
     getInstallProgress: () => fetch('/api/system/install-progress').then(r => r.json()),
     installAria2: (arch) => fetch('/api/system/install-aria2', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ arch }) }).then(r => r.json()),
     uploadAria2: (formData) => fetch('/api/system/upload-aria2', { method: 'POST', body: formData }).then(r => r.json()),
@@ -34,6 +36,7 @@ let downloadPollTimer = null;
 let isRefreshing = false;
 let currentDownloadTasks = [];
 let currentDlFilter = 'all';
+let currentUpdateInfo = null;
 
 let cachedRemoteNodes = [];
 let cachedLocalNodes = [];
@@ -389,6 +392,11 @@ async function initMainApp() {
         rpcSecret.addEventListener('change', () => autoSaveConfig(rpcSecret));
         rpcSecret.addEventListener('blur', () => autoSaveConfig(rpcSecret));
     }
+
+    document.getElementById('btnCheckUpdate')?.addEventListener('click', async () => {
+        await loadUpdateInfo(true);
+    });
+    document.getElementById('btnInstallUpdate')?.addEventListener('click', openUpdateDownload);
     
     // 顶部操作栏事件
     document.getElementById('btnResumeAll')?.addEventListener('click', async () => { await API.resumeAll(); showToast('success', '已发送全部恢复请求'); pollDownloadStatus(); });
@@ -445,8 +453,104 @@ async function loadConfig() {
             if (c.teldrive_url && c.access_token) setConnectionStatus(true);
 
             await loadTreesOnStartup();
+            loadUpdateInfo(false);
         }
     } catch (e) { console.error('加载配置失败:', e); }
+}
+
+async function loadUpdateInfo(showToastWhenNoUpdate) {
+    const checkBtn = document.getElementById('btnCheckUpdate');
+    if (checkBtn) {
+        checkBtn.disabled = true;
+        checkBtn.classList.add('loading');
+    }
+
+    try {
+        const resp = await API.getUpdateInfo();
+        if (!resp.success || !resp.data) {
+            throw new Error(resp.message || 'Failed to load update info');
+        }
+
+        renderUpdateInfo(resp.data);
+        if (showToastWhenNoUpdate) {
+            showToast(
+                resp.data.has_update ? 'success' : 'info',
+                resp.data.has_update
+                    ? `Update ${resp.data.latest_version} is available`
+                    : 'You are already on the latest version'
+            );
+        }
+    } catch (e) {
+        renderUpdateError(e.message);
+        if (showToastWhenNoUpdate) {
+            showToast('error', 'Update check failed: ' + e.message);
+        }
+    } finally {
+        if (checkBtn) {
+            checkBtn.disabled = false;
+            checkBtn.classList.remove('loading');
+        }
+    }
+}
+
+function renderUpdateInfo(info) {
+    currentUpdateInfo = info;
+    const statusBadge = document.getElementById('updateStatusBadge');
+    const installBtn = document.getElementById('btnInstallUpdate');
+    const publishedAt = info.published_at ? new Date(info.published_at).toLocaleString() : '--';
+
+    document.getElementById('updateCurrentVersion').textContent = info.current_version || '--';
+    document.getElementById('updateLatestVersion').textContent = info.latest_version || '--';
+    document.getElementById('updatePublishedAt').textContent = publishedAt;
+    document.getElementById('updateNotes').textContent = info.release_notes || 'No release notes.';
+
+    if (statusBadge) {
+        if (info.has_update) {
+            statusBadge.className = 'wizard-status-badge success';
+            statusBadge.textContent = 'Update available';
+        } else {
+            statusBadge.className = 'wizard-status-badge info';
+            statusBadge.textContent = 'Up to date';
+        }
+    }
+
+    if (installBtn) {
+        installBtn.style.display = info.has_update ? 'inline-flex' : 'none';
+        installBtn.textContent = info.asset_name ? `Download ${info.asset_name}` : 'View release page';
+        installBtn.disabled = false;
+    }
+}
+
+function renderUpdateError(message) {
+    currentUpdateInfo = null;
+    document.getElementById('updateCurrentVersion').textContent = '--';
+    document.getElementById('updateLatestVersion').textContent = '--';
+    document.getElementById('updatePublishedAt').textContent = '--';
+    document.getElementById('updateNotes').textContent = message || 'Failed to load update information.';
+
+    const statusBadge = document.getElementById('updateStatusBadge');
+    if (statusBadge) {
+        statusBadge.className = 'wizard-status-badge error';
+        statusBadge.textContent = 'Check failed';
+    }
+
+    const installBtn = document.getElementById('btnInstallUpdate');
+    if (installBtn) {
+        installBtn.style.display = 'none';
+    }
+}
+
+async function openUpdateDownload() {
+    try {
+        const target = currentUpdateInfo?.download_url || currentUpdateInfo?.release_url;
+        if (!target) {
+            throw new Error('No release URL available');
+        }
+        window.open(target, '_blank', 'noopener,noreferrer');
+        showToast('success', 'Opened update page');
+    } catch (e) {
+        showToast('error', 'Unable to open update page: ' + e.message);
+    }
 }
 
 async function loadTreesOnStartup() {
@@ -1250,6 +1354,22 @@ function renderDownloadPage(tasks) {
     }
 }
 
+function buildDownloadActionsHtml(taskId, statusKey) {
+    const actions = [];
+    if (statusKey === 'Queued' || statusKey === 'Downloading') {
+        actions.push(`<button class="btn-action cancel" onclick="cancelTask('${taskId}')" title="Cancel task">Cancel</button>`);
+    } else {
+        if (statusKey === 'Failed') {
+            actions.push(`<button class="btn-action retry" onclick="retryTask('${taskId}')" title="Retry task">Retry</button>`);
+        }
+        if (statusKey === 'Completed' || statusKey === 'Failed' || statusKey === 'Cancelled') {
+            actions.push(`<button class="btn-action remove" onclick="removeTask('${taskId}')" title="Remove record">Remove</button>`);
+        }
+    }
+
+    return actions.join('');
+}
+
 function createDownloadItem(task) {
     const statusKey = getStatusKey(task.status);
     const item = document.createElement('div');
@@ -1271,11 +1391,7 @@ function createDownloadItem(task) {
     }
 
     let speedText = statusKey === 'Downloading' && task.speed > 0 ? ` · ${formatSpeed(task.speed)}` : '';
-    let actionsHtml = '';
-    if (statusKey === 'Failed' || statusKey === 'Cancelled')
-        actionsHtml = `<button class="btn-action retry" onclick="retryTask('${task.id}')" title="重试">🔄</button>`;
-    else if (statusKey === 'Queued' || statusKey === 'Downloading')
-        actionsHtml = `<button class="btn-action cancel" onclick="cancelTask('${task.id}')" title="取消">✕</button>`;
+    const actionsHtml = buildDownloadActionsHtml(task.id, statusKey);
 
     item.innerHTML = `
         <span class="download-item-icon">${getFileIcon({ name: task.file_name, is_dir: false })}</span>
@@ -1328,61 +1444,34 @@ function updateDownloadItem(el, task) {
         statusEl.className = 'download-item-status ' + statusClass;
         statusEl.textContent = statusLabel;
     }
+
+    const actionsEl = el.querySelector('.download-item-actions');
+    if (actionsEl) {
+        actionsEl.innerHTML = buildDownloadActionsHtml(task.id, statusKey);
+    }
 }
 
 async function cancelTask(taskId) {
-    // 先从当前任务列表中找到该任务的 remote_path，以便同步清理 DOM
-    const task = currentDownloadTasks.find(t => t.id === taskId);
-    const remotePath = task ? task.remote_path : null;
-
     await API.cancelDownload(taskId);
-    showToast('info', '任务已取消');
-
-    if (remotePath) {
-        // 清理本地树中对应的 DOM 节点，并级联删除空文件夹
-        const localRow = document.querySelector(`#localTree .tree-node-row[data-path="${remotePath}"]`);
-        if (localRow) {
-            let current = localRow.parentElement;
-            while (current && current.classList.contains('tree-node')) {
-                let container = current.parentElement;
-                current.remove();
-                if (container && container.classList.contains('tree-children') && container.childElementCount === 0) {
-                    current = container.parentElement;
-                } else {
-                    break;
-                }
-            }
-        }
-
-        // 重置远程树中对应节点的删除按钮为加号
-        const remoteRows = document.querySelectorAll('#remoteTree .tree-node-row');
-        remoteRows.forEach(row => {
-            if (row.dataset.path === remotePath) {
-                row.removeAttribute('data-completed');
-                // 移除进度条
-                const bg = row.querySelector('.inline-progress-bg');
-                if (bg) bg.remove();
-                // 重建操作按钮
-                const actionDiv = row.querySelector('.tree-action');
-                if (actionDiv) {
-                    actionDiv.innerHTML = '';
-                    const addBtn = document.createElement('button');
-                    addBtn.className = 'btn-action add';
-                    addBtn.innerHTML = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`;
-                    addBtn.title = '加入下载队列';
-                    addBtn.addEventListener('click', (e) => { e.stopPropagation(); enqueueDownload(row.dataset.path, addBtn); });
-                    actionDiv.appendChild(addBtn);
-                }
-            }
-        });
-    }
-
-    // 触发一次轮询以更新下载列表
+    showToast('info', 'Task cancelled');
     await pollDownloadStatus();
 }
-async function retryTask(taskId) { await API.retryDownload(taskId); showToast('info', '任务已重新入队'); }
+
+async function retryTask(taskId) {
+    await API.retryDownload(taskId);
+    showToast('info', 'Task queued again');
+    await pollDownloadStatus();
+}
+
+async function removeTask(taskId) {
+    await API.removeDownload(taskId);
+    showToast('info', 'Download record removed');
+    await pollDownloadStatus();
+}
+
 window.cancelTask = cancelTask;
 window.retryTask = retryTask;
+window.removeTask = removeTask;
 
 // ===== 工具 =====
 function buildDownloadMap() {

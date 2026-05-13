@@ -1,18 +1,22 @@
 mod api;
-mod config;
 mod aria2;
+mod config;
 mod scanner;
 mod state;
 mod teldrive;
 mod tree_cache;
 mod tree_sync;
+#[cfg(test)]
+mod api_tests;
 
+use axum::extract::Request;
 use axum::http::header;
-use axum::response::Html;
+use axum::http::{HeaderValue, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use std::time::Duration;
-use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 
 const STATIC_HTML: &str = include_str!("../static/index.html");
@@ -28,15 +32,13 @@ async fn main() {
         )
         .init();
 
-    info!("TelSync 正在启动...");
+    info!("TelSync starting...");
 
     let config = config::AppConfig::load();
-    info!("配置加载完成");
+    info!("Configuration loaded");
 
-    // Aria2 的预设交互端口为 16800
     let rpc_port = 16800;
-    
-    // 如果存在本地 aria2，则启动它作为子进程（如果不存在，前台页面引导用户下载）
+
     if aria2::check_aria2_exists() {
         let _ = aria2::spawn_aria2(aria2::SpawnAria2Options {
             local_dir: &config.local_path,
@@ -49,7 +51,7 @@ async fn main() {
             rpc_secret: &config.rpc_secret,
         });
     } else {
-        info!("未检测到 Aria2 核心，需要进入配置向导");
+        info!("Aria2 binary not found, setup wizard will guide installation");
     }
 
     let app_state = state::AppState::new(config, rpc_port);
@@ -60,53 +62,88 @@ async fn main() {
         loop {
             interval.tick().await;
             if let Err(e) = tree_sync::refresh_and_store(&scheduled_refresh_state, "scheduled").await {
-                warn!("后台定时刷新文件树失败: {}", e);
+                warn!("Background tree refresh failed: {}", e);
             }
         }
     });
 
-    // 构建路由
-    let app = Router::new()
-        // 静态文件
-        .route("/", get(serve_html))
-        .route("/style.css", get(serve_css))
-        .route("/app.js", get(serve_js))
-        // API 路由
+    let mutating_api = Router::new()
         .route("/api/config", get(api::get_config).post(api::save_config))
         .route("/api/test-connection", post(api::test_connection))
-        .route("/api/trees", get(api::get_trees))
         .route("/api/trees/initial", post(api::initial_trees))
         .route("/api/trees/refresh", post(api::refresh_trees))
-        .route("/api/trees/events", get(api::tree_events))
         .route("/api/download/enqueue", post(api::enqueue_download))
         .route("/api/download/delete", post(api::delete_local_file))
-        .route("/api/download/status", get(api::download_status))
         .route("/api/download/cancel", post(api::cancel_download))
         .route("/api/download/remove", post(api::remove_download))
         .route("/api/download/retry", post(api::retry_download))
         .route("/api/download/pause-all", post(api::pause_all))
         .route("/api/download/resume-all", post(api::resume_all))
-
         .route("/api/download/clear-failed", post(api::clear_failed))
         .route("/api/download/clear-all", post(api::clear_all))
-        .route("/api/system/init-status", get(api::init_status))
+        .route("/api/system/open-update-download", post(api::open_update_download))
         .route("/api/system/install-aria2", post(api::install_aria2))
-        .route("/api/system/install-progress", get(api::install_progress))
         .route("/api/system/upload-aria2", post(api::upload_aria2))
-        .layer(CorsLayer::permissive())
+        .route_layer(middleware::from_fn(require_same_origin));
+
+    let app = Router::new()
+        .route("/", get(serve_html))
+        .route("/style.css", get(serve_css))
+        .route("/app.js", get(serve_js))
+        .route("/api/trees", get(api::get_trees))
+        .route("/api/trees/events", get(api::tree_events))
+        .route("/api/download/status", get(api::download_status))
+        .route("/api/system/init-status", get(api::init_status))
+        .route("/api/system/update-info", get(api::get_update_info))
+        .route("/api/system/install-progress", get(api::install_progress))
+        .merge(mutating_api)
         .with_state(app_state.clone());
 
     let port = 5300;
-    let addr = format!("0.0.0.0:{}", port);
-    info!("TelSync 已启动: http://localhost:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
+    info!("TelSync listening on http://localhost:{}", port);
 
-    // 自动打开浏览器
     let _ = open::that(format!("http://localhost:{}", port));
-
-
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn require_same_origin(req: Request, next: Next) -> Result<Response, StatusCode> {
+    let origin = req.headers().get(header::ORIGIN);
+    let referer = req.headers().get(header::REFERER);
+
+    let has_allowed_origin = origin
+        .and_then(header_value_as_str)
+        .map(is_allowed_origin)
+        .unwrap_or(false);
+    let has_allowed_referer = referer
+        .and_then(header_value_as_str)
+        .map(is_allowed_referer)
+        .unwrap_or(false);
+
+    if origin.is_some() || referer.is_some() {
+        if !(has_allowed_origin || has_allowed_referer) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+
+    Ok(next.run(req).await)
+}
+
+fn header_value_as_str(value: &HeaderValue) -> Option<&str> {
+    value.to_str().ok()
+}
+
+fn is_allowed_origin(origin: &str) -> bool {
+    origin == "http://127.0.0.1:5300" || origin == "http://localhost:5300"
+}
+
+fn is_allowed_referer(referer: &str) -> bool {
+    referer == "http://127.0.0.1:5300"
+        || referer.starts_with("http://127.0.0.1:5300/")
+        || referer == "http://localhost:5300"
+        || referer.starts_with("http://localhost:5300/")
 }
 
 async fn serve_html() -> Html<&'static str> {

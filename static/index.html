@@ -359,6 +359,30 @@
                         </div>
                     </div>
                 </div>
+                <div class="settings-section">
+                    <div class="settings-section-header">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--accent-blue)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"></path><path d="M7 10l5 5 5-5"></path><path d="M5 21h14"></path></svg>
+                        <h3>App Updates</h3>
+                    </div>
+                    <div class="settings-group update-group">
+                        <div class="wizard-status-row">
+                            <span class="wizard-status-badge info" id="updateStatusBadge">Not checked</span>
+                            <div class="update-actions">
+                                <button class="btn btn-secondary" id="btnCheckUpdate">Check now</button>
+                                <button class="btn btn-primary" id="btnInstallUpdate" style="display:none;">Open download</button>
+                            </div>
+                        </div>
+                        <div class="update-grid">
+                            <div class="update-meta-card"><span>Current</span><strong id="updateCurrentVersion">--</strong></div>
+                            <div class="update-meta-card"><span>Latest</span><strong id="updateLatestVersion">--</strong></div>
+                            <div class="update-meta-card"><span>Published</span><strong id="updatePublishedAt">--</strong></div>
+                        </div>
+                        <div class="form-group">
+                            <label>Release Notes</label>
+                            <div class="update-notes" id="updateNotes">No release information loaded.</div>
+                        </div>
+                    </div>
+                </div>
                 <div class="test-result" id="testResult"></div>
             </div>
         </div>

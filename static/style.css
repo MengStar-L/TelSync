@@ -660,6 +660,59 @@ body {
 .test-result.success { display: block; background: rgba(0,184,148,0.08); color: var(--accent-green); border: 1px solid rgba(0,184,148,0.15); }
 .test-result.error { display: block; background: rgba(231,76,60,0.08); color: var(--accent-red); border: 1px solid rgba(231,76,60,0.15); }
 
+.update-group {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.update-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.update-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px;
+}
+
+.update-meta-card {
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(0,0,0,0.05);
+    background: rgba(255,255,255,0.72);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.update-meta-card span {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+}
+
+.update-meta-card strong {
+    font-size: 0.84rem;
+    color: var(--text-primary);
+    word-break: break-word;
+}
+
+.update-notes {
+    min-height: 132px;
+    max-height: 220px;
+    overflow: auto;
+    padding: 12px 14px;
+    border-radius: var(--radius-md);
+    border: 1px solid rgba(0,0,0,0.06);
+    background: rgba(255,255,255,0.74);
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+    line-height: 1.55;
+    white-space: pre-wrap;
+}
+
 @media (max-width: 980px) {
     .settings-content {
         grid-template-columns: 1fr;
@@ -676,6 +729,10 @@ body {
 
     .input-with-btn .save-icon {
         right: 10px;
+    }
+
+    .update-grid {
+        grid-template-columns: 1fr;
     }
 }
 

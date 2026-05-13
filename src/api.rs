@@ -9,6 +9,7 @@ use axum::response::Json;
 use futures_util::stream;
 use once_cell::sync::Lazy;
 use reqwest::{Client, Url};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::fs::File;
@@ -86,6 +87,67 @@ fn normalize_proxy_url(raw: &str) -> Result<String, String> {
     }
 
     Ok(proxy_url.to_string())
+}
+
+fn normalized_existing_path(path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|_| "目标路径非法".to_string())
+}
+
+fn validate_relative_request_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("目标路径非法".to_string());
+    }
+
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return Err("目标路径非法".to_string());
+    }
+
+    let mut relative = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(part) => relative.push(part),
+            std::path::Component::CurDir => {}
+            _ => return Err("目标路径非法".to_string()),
+        }
+    }
+
+    if relative.as_os_str().is_empty() {
+        return Err("目标路径非法".to_string());
+    }
+
+    Ok(relative)
+}
+
+pub(crate) fn resolve_local_target(local_root: &Path, raw_path: &str) -> Result<PathBuf, String> {
+    let root = normalized_existing_path(local_root)?;
+    let relative = validate_relative_request_path(raw_path)?;
+    let joined = root.join(relative);
+
+    if joined.exists() {
+        let canonical_target = normalized_existing_path(&joined)?;
+        if canonical_target.starts_with(&root) {
+            Ok(canonical_target)
+        } else {
+            Err("目标路径非法".to_string())
+        }
+    } else {
+        let parent = joined.parent().ok_or_else(|| "目标路径非法".to_string())?;
+        let canonical_parent = normalized_existing_path(parent)?;
+        if canonical_parent.starts_with(&root) {
+            Ok(joined)
+        } else {
+            Err("目标路径非法".to_string())
+        }
+    }
+}
+
+fn path_within_root(path: &Path, local_root: &Path) -> bool {
+    match (normalized_existing_path(path), normalized_existing_path(local_root)) {
+        (Ok(target), Ok(root)) => target.starts_with(&root),
+        _ => false,
+    }
 }
 
 fn build_aria2_global_options(config: &AppConfig) -> serde_json::Value {
@@ -503,18 +565,26 @@ fn tracked_aria2_related_paths(file_path: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn cleanup_empty_parent_dirs(start: &Path, local_root: &Path) {
-    let mut current_dir = start.parent();
+pub(crate) fn cleanup_empty_parent_dirs(start: &Path, local_root: &Path) {
+    let Ok(root) = normalized_existing_path(local_root) else {
+        return;
+    };
+
+    let mut current_dir = start.parent().map(Path::to_path_buf);
     while let Some(parent) = current_dir {
-        if parent == local_root || !parent.starts_with(local_root) {
+        let Ok(parent_canonical) = normalized_existing_path(&parent) else {
+            break;
+        };
+
+        if parent_canonical == root || !parent_canonical.starts_with(&root) {
             break;
         }
 
-        match std::fs::read_dir(parent) {
+        match std::fs::read_dir(&parent_canonical) {
             Ok(mut iter) => {
                 if iter.next().is_none() {
-                    let _ = std::fs::remove_dir(parent);
-                    current_dir = parent.parent();
+                    let _ = std::fs::remove_dir(&parent_canonical);
+                    current_dir = parent_canonical.parent().map(Path::to_path_buf);
                 } else {
                     break;
                 }
@@ -526,6 +596,9 @@ fn cleanup_empty_parent_dirs(start: &Path, local_root: &Path) {
 
 fn cleanup_download_artifacts(files: &[PathBuf], local_root: &Path) {
     for file_path in files {
+        if !path_within_root(file_path, local_root) {
+            continue;
+        }
         for path in tracked_aria2_related_paths(file_path) {
             let _ = std::fs::remove_file(path);
         }
@@ -542,6 +615,128 @@ fn collect_task_file_paths(task: &serde_json::Value) -> Vec<PathBuf> {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .collect()
+}
+
+fn current_release_repo() -> &'static str {
+    "MengStar-L/TelSync"
+}
+
+fn current_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+fn current_arch_asset_keywords() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") {
+        &["windows-amd64", "win-x64", "win64", "x86_64-pc-windows"]
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") {
+        &["linux-amd64", "linux-x64", "x86_64-unknown-linux"]
+    } else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") {
+        &["linux-arm64", "linux-aarch64", "aarch64-unknown-linux"]
+    } else {
+        &[]
+    }
+}
+
+fn parse_version_tag(tag: &str) -> Option<Version> {
+    Version::parse(tag.trim().trim_start_matches('v')).ok()
+}
+
+fn extract_release_notes(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        "No release notes.".to_string()
+    } else {
+        trimmed.chars().take(1500).collect()
+    }
+}
+
+#[derive(Serialize)]
+pub struct UpdateInfo {
+    pub current_version: String,
+    pub latest_version: String,
+    pub published_at: Option<String>,
+    pub release_notes: String,
+    pub has_update: bool,
+    pub release_url: String,
+    pub download_url: String,
+    pub asset_name: Option<String>,
+    pub supported_arch: bool,
+}
+
+pub(crate) fn build_update_info_from_release(
+    release: &serde_json::Value,
+    current_version: &str,
+) -> UpdateInfo {
+    let latest_version = release["tag_name"]
+        .as_str()
+        .unwrap_or("unknown")
+        .trim_start_matches('v')
+        .to_string();
+    let published_at = release["published_at"].as_str().map(str::to_string);
+    let release_notes = extract_release_notes(release["body"].as_str().unwrap_or(""));
+    let release_url = release["html_url"].as_str().unwrap_or("").to_string();
+    let supported_arch = !current_arch_asset_keywords().is_empty();
+
+    let asset = release["assets"].as_array().and_then(|assets| {
+        assets.iter().find(|asset| {
+            let name = asset["name"].as_str().unwrap_or("").to_ascii_lowercase();
+            current_arch_asset_keywords()
+                .iter()
+                .any(|keyword| name.contains(keyword))
+        })
+    });
+
+    let asset_name = asset.and_then(|item| item["name"].as_str()).map(str::to_string);
+    let download_url = asset
+        .and_then(|item| item["browser_download_url"].as_str())
+        .map(str::to_string)
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| release_url.clone());
+
+    let has_update = match (
+        parse_version_tag(current_version),
+        parse_version_tag(&latest_version),
+    ) {
+        (Some(current), Some(latest)) => latest > current,
+        _ => latest_version != current_version,
+    };
+
+    UpdateInfo {
+        current_version: current_version.to_string(),
+        latest_version,
+        published_at,
+        release_notes,
+        has_update,
+        release_url,
+        download_url,
+        asset_name,
+        supported_arch,
+    }
+}
+
+async fn fetch_update_info() -> Result<UpdateInfo, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+
+    let release: serde_json::Value = client
+        .get(format!(
+            "https://api.github.com/repos/{}/releases/latest",
+            current_release_repo()
+        ))
+        .header("User-Agent", "TelSync")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch latest release: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("GitHub returned an error: {}", e))?
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse release info: {}", e))?;
+
+    Ok(build_update_info_from_release(&release, &current_app_version()))
 }
 
 #[derive(Deserialize)]
@@ -634,8 +829,9 @@ pub async fn delete_local_file(
     Json(req): Json<DeleteFileRequest>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
     let config = state.config.read().await.clone();
-    let local_path = config.local_path.clone();
-    let target_path = std::path::Path::new(&local_path).join(req.path.trim_start_matches('/'));
+    let local_root = PathBuf::from(&config.local_path);
+    let target_path =
+        resolve_local_target(&local_root, &req.path).map_err(|e| err_response::<String>(&e))?;
 
     if !target_path.exists() {
         return Err(err_response("本地文件不存在"));
@@ -651,26 +847,7 @@ pub async fn delete_local_file(
         let _ = std::fs::remove_file(aria2_path);
     }
 
-    // 向上兜底检查：如果删除后所在目录变为空，则顺藤摸瓜将空文件夹全部删掉，直到 local_path
-    let mut current_dir = target_path.parent();
-    let local_path_buf = std::path::PathBuf::from(&local_path);
-    while let Some(parent) = current_dir {
-        if parent == local_path_buf { break; } // 到达根目录，停止
-        if parent.starts_with(&local_path_buf) {
-            if let Ok(mut iter) = std::fs::read_dir(parent) {
-                if iter.next().is_none() { 
-                    let _ = std::fs::remove_dir(parent); // 是空文件夹，移除
-                } else {
-                    break; // 非空，停止向上清理
-                }
-            } else {
-                break;
-            }
-            current_dir = parent.parent();
-        } else {
-            break;
-        }
-    }
+    cleanup_empty_parent_dirs(&target_path, &local_root);
 
     refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
 
@@ -979,6 +1156,29 @@ pub async fn init_status(State(state): State<Arc<AppState>>) -> Json<ApiResponse
 pub async fn install_progress() -> Json<ApiResponse<InstallProgress>> {
     let state = INSTALL_STATE.read().await.clone();
     ok_response(state)
+}
+
+pub async fn get_update_info(
+) -> Result<Json<ApiResponse<UpdateInfo>>, (StatusCode, Json<ApiResponse<UpdateInfo>>)> {
+    let info = fetch_update_info()
+        .await
+        .map_err(|e| err_response::<UpdateInfo>(&e))?;
+    Ok(ok_response(info))
+}
+
+pub async fn open_update_download(
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let info = fetch_update_info()
+        .await
+        .map_err(|e| err_response::<String>(&e))?;
+
+    let target = if info.has_update {
+        info.download_url
+    } else {
+        info.release_url
+    };
+
+    Ok(ok_response(target))
 }
 
 #[derive(Deserialize)]

@@ -1,5 +1,5 @@
 use crate::state::FileNode;
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tracing::info;
 
@@ -30,7 +30,6 @@ struct TelDriveMeta {
 }
 
 pub struct TelDriveClient {
-    /// API 客户端（列文件、测试连接等，支持自动解压）
     client: Client,
     base_url: String,
     access_token: String,
@@ -38,12 +37,11 @@ pub struct TelDriveClient {
 
 impl TelDriveClient {
     pub fn new(base_url: &str, access_token: &str) -> Self {
-        // API 客户端：短超时，自动解压
         let client = Client::builder()
             .connect_timeout(std::time::Duration::from_secs(15))
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .expect("创建 HTTP 客户端失败");
+            .expect("failed to create TelDrive HTTP client");
 
         Self {
             client,
@@ -52,7 +50,6 @@ impl TelDriveClient {
         }
     }
 
-    /// 列出指定路径下的所有文件和文件夹（单层）
     async fn list_path(&self, path: &str) -> Result<Vec<TelDriveFile>, String> {
         let mut all_files = Vec::new();
         let mut cursor: Option<String> = None;
@@ -97,9 +94,8 @@ impl TelDriveClient {
         Ok(all_files)
     }
 
-    /// 递归获取指定路径下的完整文件树
     pub async fn fetch_tree(&self, path: &str) -> Result<Vec<FileNode>, String> {
-        info!("正在扫描远程路径: {}", path);
+        info!("Scanning remote path: {}", path);
         let files = self.list_path(path).await?;
         let mut nodes = Vec::new();
 
@@ -111,7 +107,6 @@ impl TelDriveClient {
             };
 
             if file.file_type == "folder" {
-                // 递归获取子目录
                 let children = Box::pin(self.fetch_tree(&child_path)).await?;
                 nodes.push(FileNode {
                     name: file.name,
@@ -140,9 +135,6 @@ impl TelDriveClient {
         Ok(nodes)
     }
 
-
-
-    /// 测试连接
     pub async fn test_connection(&self) -> Result<String, String> {
         let url = format!("{}/api/auth/session", self.base_url);
         let resp = self
@@ -153,12 +145,45 @@ impl TelDriveClient {
             .await
             .map_err(|e| format!("连接失败: {}", e))?;
 
-        if resp.status().is_success() {
-            Ok("连接成功".to_string())
-        } else if resp.status().as_u16() == 204 {
-            Err("认证令牌无效，请检查 access_token".to_string())
-        } else {
-            Err(format!("连接失败，状态码: {}", resp.status()))
-        }
+        classify_test_connection_status(resp.status())
+    }
+}
+
+fn classify_test_connection_status(status: StatusCode) -> Result<String, String> {
+    if status == StatusCode::NO_CONTENT {
+        Err("认证令牌无效，请检查 access_token".to_string())
+    } else if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+        Err("认证失败，请重新获取 access_token".to_string())
+    } else if status.is_success() {
+        Ok("连接成功".to_string())
+    } else {
+        Err(format!("连接失败，状态码: {}", status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_test_connection_status;
+    use reqwest::StatusCode;
+
+    #[test]
+    fn treats_200_as_success() {
+        assert!(classify_test_connection_status(StatusCode::OK).is_ok());
+    }
+
+    #[test]
+    fn treats_204_as_invalid_token() {
+        let err = classify_test_connection_status(StatusCode::NO_CONTENT).unwrap_err();
+        assert!(err.contains("access_token"));
+    }
+
+    #[test]
+    fn treats_401_and_403_as_auth_failures() {
+        assert!(classify_test_connection_status(StatusCode::UNAUTHORIZED)
+            .unwrap_err()
+            .contains("认证失败"));
+        assert!(classify_test_connection_status(StatusCode::FORBIDDEN)
+            .unwrap_err()
+            .contains("认证失败"));
     }
 }
