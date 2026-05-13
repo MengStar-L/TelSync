@@ -119,16 +119,16 @@ fn spawn_aria2_from_config(config: &AppConfig) -> Result<(), String> {
         &config.local_path
     };
 
-    crate::aria2::spawn_aria2(
-        local_path,
-        16800,
-        config.max_concurrent_downloads,
-        &config.proxy_url,
-        &config.proxy_user,
-        &config.proxy_passwd,
-        config.rpc_allow_remote,
-        &config.rpc_secret,
-    )
+    crate::aria2::spawn_aria2(crate::aria2::SpawnAria2Options {
+        local_dir: local_path,
+        port: 16800,
+        max_concurrent: config.max_concurrent_downloads,
+        proxy_url: &config.proxy_url,
+        proxy_user: &config.proxy_user,
+        proxy_passwd: &config.proxy_passwd,
+        rpc_allow_remote: config.rpc_allow_remote,
+        rpc_secret: &config.rpc_secret,
+    })
 }
 
 async fn restart_aria2_with_config(state: &Arc<AppState>, config: &AppConfig) -> String {
@@ -413,6 +413,80 @@ pub fn flatten_files(nodes: &[FileNode], root_path: &str) -> Vec<FileNode> {
     result
 }
 
+fn build_download_url(base_url: &str, remote_id: &str, remote_path: &str) -> Result<String, String> {
+    let mut url = Url::parse(&format!(
+        "{}/api/files/{}/download",
+        base_url.trim_end_matches('/'),
+        remote_id
+    ))
+    .map_err(|e| format!("Build download url failed: {}", e))?;
+    url.query_pairs_mut().append_pair("ts_path", remote_path);
+    Ok(url.to_string())
+}
+
+fn task_file_path(task: &serde_json::Value) -> Option<&str> {
+    task["files"].as_array()?.first()?.get("path")?.as_str()
+}
+
+fn task_file_name(task: &serde_json::Value) -> Option<String> {
+    let full_path = task_file_path(task)?;
+    Path::new(full_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+}
+
+fn task_remote_path(task: &serde_json::Value, local_path_normalized: &str) -> Option<String> {
+    let file_name = task_file_name(task)?;
+
+    if let Some(uri) = task["files"]
+        .as_array()
+        .and_then(|files| files.first())
+        .and_then(|file| file["uris"].as_array())
+        .and_then(|uris| uris.iter().find_map(|uri| uri["uri"].as_str()))
+    {
+        if let Ok(parsed) = Url::parse(uri) {
+            for (key, value) in parsed.query_pairs() {
+                if key == "ts_path" {
+                    return Some(value.into_owned());
+                }
+            }
+        }
+    }
+
+    if let Some(dir) = task["dir"].as_str() {
+        let dir_normalized = dir.replace("\\", "/");
+        let dir_lower = dir_normalized.to_lowercase();
+        let local_lower = local_path_normalized.to_lowercase();
+        let relative_dir = if dir_lower.starts_with(&local_lower) {
+            dir_normalized[local_path_normalized.len()..].to_string()
+        } else {
+            String::new()
+        };
+
+        let mut remote_path = format!("{}/{}", relative_dir, file_name).replace("//", "/");
+        if !remote_path.starts_with('/') {
+            remote_path = format!("/{}", remote_path);
+        }
+        return Some(remote_path);
+    }
+
+    Some(format!("/.../{}", file_name))
+}
+
+fn extract_retry_url(task: &serde_json::Value) -> Option<String> {
+    task["files"]
+        .as_array()?
+        .first()?
+        .get("uris")?
+        .as_array()?
+        .iter()
+        .find_map(|uri| uri["uri"].as_str().map(str::to_string))
+}
+
+fn find_remote_id_by_path(nodes: &[FileNode], remote_path: &str) -> Option<String> {
+    find_node(nodes, remote_path).and_then(|node| node.remote_id.clone())
+}
+
 #[derive(Deserialize)]
 pub struct EnqueueRequest {
     pub path: String,
@@ -454,7 +528,8 @@ pub async fn enqueue_download(
 
     for file in &files_to_download {
         if let Some(ref id) = file.remote_id {
-            let file_url = format!("{}/api/files/{}/download", config.teldrive_url, id);
+            let file_url = build_download_url(&config.teldrive_url, id, &file.path)
+                .map_err(|e| err_response::<EnqueueResponse>(&e))?;
             let path_parts: Vec<&str> = file.path.split('/').filter(|p| !p.is_empty()).collect();
             // path_parts = ["Hero", "VR", "test.mp4"] -> len 3. relative_dir = ["Hero", "VR"]
             let relative_dir = if path_parts.len() > 1 {
@@ -569,12 +644,6 @@ pub async fn download_status(
             let gid = t["gid"].as_str().unwrap_or("").to_string();
             let status_raw = t["status"].as_str().unwrap_or("unknown");
             
-            // 收到指令要求不再保留已完成的条目，直接在 Aria2 中彻底清掉记录也不向前端展示
-            if status_raw == "complete" {
-                let _ = state.aria2_client.remove_download_result(&gid).await;
-                continue;
-            }
-
             let total = t["totalLength"].as_str().unwrap_or("0").parse().unwrap_or(0);
             let downloaded = t["completedLength"]
                 .as_str()
@@ -618,6 +687,9 @@ pub async fn download_status(
                     }
                 }
             }
+
+            let file_name = task_file_name(&t).unwrap_or(file_name);
+            let remote_path = task_remote_path(&t, &local_path_normalized).unwrap_or(remote_path);
 
             let status = match status_raw {
                 "active" => "Downloading",
@@ -672,7 +744,6 @@ pub async fn cancel_download(
 
     // 移除 Aria2 任务
     let _ = state.aria2_client.remove(&req.task_id).await;
-    let _ = state.aria2_client.remove_download_result(&req.task_id).await;
 
     // 清理本地残留文件
     let config = state.config.read().await.clone();
@@ -705,12 +776,57 @@ pub async fn cancel_download(
 
 pub async fn retry_download(
     State(state): State<Arc<AppState>>,
-    Json(_req): Json<TaskAction>,
+    Json(req): Json<TaskAction>,
 ) -> Json<ApiResponse<String>> {
-    // Aria2 无法简单 unpause error 状态的任务除非重新加入，但这里为了极简处理，我们只尝试解绑错误记录并重试
-    // 在真实应用中可能需要提取原 url。
-    let _ = state.aria2_client.purge_download_result().await;
-    ok_response("Aria2重试触发".to_string())
+    let task = match state.aria2_client.tell_status(&req.task_id).await {
+        Ok(task) => task,
+        Err(e) => return ok_response(format!("Failed to load task details: {}", e)),
+    };
+
+    let status = task["status"].as_str().unwrap_or("");
+    if status != "error" && status != "removed" {
+        return ok_response("Task is not retryable".to_string());
+    }
+
+    let file_name = match task_file_name(&task) {
+        Some(name) => name,
+        None => return ok_response("Missing original file name".to_string()),
+    };
+    let out_dir = task["dir"].as_str().unwrap_or("").to_string();
+    if out_dir.is_empty() {
+        return ok_response("Missing original download directory".to_string());
+    }
+
+    let config = state.config.read().await.clone();
+    let local_path_normalized = config.local_path.replace("\\", "/");
+    let mut retry_url = extract_retry_url(&task);
+    if retry_url.is_none() {
+        if let Some(remote_path) = task_remote_path(&task, &local_path_normalized) {
+            let remote_tree = state.remote_tree.read().await;
+            if let Some(remote_nodes) = remote_tree.as_ref() {
+                if let Some(remote_id) = find_remote_id_by_path(remote_nodes, &remote_path) {
+                    retry_url = build_download_url(&config.teldrive_url, &remote_id, &remote_path).ok();
+                }
+            }
+        }
+    }
+
+    let retry_url = match retry_url {
+        Some(url) => url,
+        None => return ok_response("Missing retry source information".to_string()),
+    };
+
+    match state
+        .aria2_client
+        .add_uri(&retry_url, &file_name, &out_dir, &config.access_token)
+        .await
+    {
+        Ok(_) => {
+            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
+            ok_response("Task requeued".to_string())
+        }
+        Err(e) => ok_response(format!("Retry failed: {}", e)),
+    }
 }
 
 pub async fn pause_all(State(state): State<Arc<AppState>>) -> Json<ApiResponse<String>> {

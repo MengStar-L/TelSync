@@ -22,7 +22,7 @@ fn scan_dir_recursive(dir: &Path, relative_prefix: &str) -> Result<Vec<FileNode>
     let entries = std::fs::read_dir(dir).map_err(|e| format!("读取目录失败 {:?}: {}", dir, e))?;
 
     let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-    entries.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+    entries.sort_by_key(|a| a.file_name());
 
     for entry in entries {
         let file_name = entry.file_name().to_string_lossy().to_string();
@@ -71,7 +71,7 @@ fn scan_dir_recursive(dir: &Path, relative_prefix: &str) -> Result<Vec<FileNode>
 }
 
 /// 将远程树与本地树对比，标记 exists_locally
-pub fn mark_local_existence(remote_nodes: &mut Vec<FileNode>, local_nodes: &[FileNode]) {
+pub fn mark_local_existence(remote_nodes: &mut [FileNode], local_nodes: &[FileNode]) {
     for remote in remote_nodes.iter_mut() {
         // 先重置为 false，再根据本地树的匹配结果重新标记
         remote.exists_locally = false;
@@ -92,7 +92,7 @@ pub fn mark_local_existence(remote_nodes: &mut Vec<FileNode>, local_nodes: &[Fil
 }
 
 /// 递归重置所有节点的 exists_locally 为 false
-fn reset_exists_locally(nodes: &mut Vec<FileNode>) {
+fn reset_exists_locally(nodes: &mut [FileNode]) {
     for node in nodes.iter_mut() {
         node.exists_locally = false;
         if node.is_dir {

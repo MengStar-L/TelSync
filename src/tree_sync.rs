@@ -74,7 +74,7 @@ pub async fn current_snapshot(state: &Arc<AppState>) -> TreeSnapshot {
     TreeSnapshot {
         remote: state.remote_tree.read().await.clone().unwrap_or_default(),
         local: state.local_tree.read().await.clone().unwrap_or_default(),
-        refreshed_at: state.last_tree_refresh.read().await.clone(),
+        refreshed_at: *state.last_tree_refresh.read().await,
         from_cache: *state.tree_from_cache.read().await,
     }
 }

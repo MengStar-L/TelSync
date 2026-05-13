@@ -129,7 +129,16 @@ impl Aria2Client {
 
     /// 查询单个任务的状态信息
     pub async fn tell_status(&self, gid: &str) -> Result<Value, String> {
-        let keys = json!(["gid", "status", "files", "dir"]);
+        let keys = json!([
+            "gid",
+            "status",
+            "totalLength",
+            "completedLength",
+            "downloadSpeed",
+            "files",
+            "dir",
+            "errorMessage"
+        ]);
         self.call("aria2.tellStatus", vec![json!(gid), keys]).await
     }
 
@@ -256,17 +265,29 @@ pub fn check_aria2_exists() -> bool {
     aria2_binary_path().exists()
 }
 
-pub fn spawn_aria2(
-    local_dir: &str,
-    port: u16,
-    max_concurrent: usize,
-    proxy_url: &str,
-    proxy_user: &str,
-    proxy_passwd: &str,
-    rpc_allow_remote: bool,
-    rpc_secret: &str,
-) -> Result<(), String> {
+pub struct SpawnAria2Options<'a> {
+    pub local_dir: &'a str,
+    pub port: u16,
+    pub max_concurrent: usize,
+    pub proxy_url: &'a str,
+    pub proxy_user: &'a str,
+    pub proxy_passwd: &'a str,
+    pub rpc_allow_remote: bool,
+    pub rpc_secret: &'a str,
+}
+
+pub fn spawn_aria2(options: SpawnAria2Options<'_>) -> Result<(), String> {
     let aria2_exe = aria2_binary_path();
+    let SpawnAria2Options {
+        local_dir,
+        port,
+        max_concurrent,
+        proxy_url,
+        proxy_user,
+        proxy_passwd,
+        rpc_allow_remote,
+        rpc_secret,
+    } = options;
 
     if !aria2_exe.exists() {
         return Err("未找到 Aria2".to_string());
