@@ -9,11 +9,8 @@ mod tree_sync;
 #[cfg(test)]
 mod api_tests;
 
-use axum::extract::Request;
 use axum::http::header;
-use axum::http::{HeaderValue, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::{Html, Response};
+use axum::response::Html;
 use axum::routing::{get, post};
 use axum::Router;
 use std::time::Duration;
@@ -83,8 +80,7 @@ async fn main() {
         .route("/api/download/clear-all", post(api::clear_all))
         .route("/api/system/open-update-download", post(api::open_update_download))
         .route("/api/system/install-aria2", post(api::install_aria2))
-        .route("/api/system/upload-aria2", post(api::upload_aria2))
-        .route_layer(middleware::from_fn(require_same_origin));
+        .route("/api/system/upload-aria2", post(api::upload_aria2));
 
     let app = Router::new()
         .route("/", get(serve_html))
@@ -100,50 +96,13 @@ async fn main() {
         .with_state(app_state.clone());
 
     let port = 5300;
-    let addr = format!("127.0.0.1:{}", port);
-    info!("TelSync listening on http://localhost:{}", port);
+    let addr = format!("0.0.0.0:{}", port);
+    info!("TelSync listening on http://0.0.0.0:{}", port);
 
     let _ = open::that(format!("http://localhost:{}", port));
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
-}
-
-async fn require_same_origin(req: Request, next: Next) -> Result<Response, StatusCode> {
-    let origin = req.headers().get(header::ORIGIN);
-    let referer = req.headers().get(header::REFERER);
-
-    let has_allowed_origin = origin
-        .and_then(header_value_as_str)
-        .map(is_allowed_origin)
-        .unwrap_or(false);
-    let has_allowed_referer = referer
-        .and_then(header_value_as_str)
-        .map(is_allowed_referer)
-        .unwrap_or(false);
-
-    if origin.is_some() || referer.is_some() {
-        if !(has_allowed_origin || has_allowed_referer) {
-            return Err(StatusCode::FORBIDDEN);
-        }
-    }
-
-    Ok(next.run(req).await)
-}
-
-fn header_value_as_str(value: &HeaderValue) -> Option<&str> {
-    value.to_str().ok()
-}
-
-fn is_allowed_origin(origin: &str) -> bool {
-    origin == "http://127.0.0.1:5300" || origin == "http://localhost:5300"
-}
-
-fn is_allowed_referer(referer: &str) -> bool {
-    referer == "http://127.0.0.1:5300"
-        || referer.starts_with("http://127.0.0.1:5300/")
-        || referer == "http://localhost:5300"
-        || referer.starts_with("http://localhost:5300/")
 }
 
 async fn serve_html() -> Html<&'static str> {
