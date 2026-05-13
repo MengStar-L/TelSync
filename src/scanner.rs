@@ -27,7 +27,11 @@ fn scan_dir_recursive(dir: &Path, relative_prefix: &str) -> Result<Vec<FileNode>
     for entry in entries {
         let file_name = entry.file_name().to_string_lossy().to_string();
         // 跳过隐藏文件和临时文件
-        if file_name.starts_with('.') || file_name.ends_with(".part") {
+        if file_name.starts_with('.')
+            || file_name.ends_with(".part")
+            || file_name.ends_with(".aria2")
+            || file_name.ends_with(".aria2__temp")
+        {
             continue;
         }
 

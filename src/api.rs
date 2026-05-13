@@ -7,14 +7,16 @@ use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Json;
 use futures_util::stream;
+use once_cell::sync::Lazy;
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::fs::File;
 use std::io::{copy, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock as TokioRwLock;
 use tracing::{error, info, warn};
 
 #[derive(Deserialize)]
@@ -487,6 +489,61 @@ fn find_remote_id_by_path(nodes: &[FileNode], remote_path: &str) -> Option<Strin
     find_node(nodes, remote_path).and_then(|node| node.remote_id.clone())
 }
 
+fn tracked_aria2_related_paths(file_path: &Path) -> Vec<PathBuf> {
+    let mut paths = vec![file_path.to_path_buf()];
+
+    let mut aria2_path = file_path.as_os_str().to_os_string();
+    aria2_path.push(".aria2");
+    paths.push(PathBuf::from(aria2_path));
+
+    let mut temp_path = file_path.as_os_str().to_os_string();
+    temp_path.push(".aria2__temp");
+    paths.push(PathBuf::from(temp_path));
+
+    paths
+}
+
+fn cleanup_empty_parent_dirs(start: &Path, local_root: &Path) {
+    let mut current_dir = start.parent();
+    while let Some(parent) = current_dir {
+        if parent == local_root || !parent.starts_with(local_root) {
+            break;
+        }
+
+        match std::fs::read_dir(parent) {
+            Ok(mut iter) => {
+                if iter.next().is_none() {
+                    let _ = std::fs::remove_dir(parent);
+                    current_dir = parent.parent();
+                } else {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn cleanup_download_artifacts(files: &[PathBuf], local_root: &Path) {
+    for file_path in files {
+        for path in tracked_aria2_related_paths(file_path) {
+            let _ = std::fs::remove_file(path);
+        }
+        cleanup_empty_parent_dirs(file_path, local_root);
+    }
+}
+
+fn collect_task_file_paths(task: &serde_json::Value) -> Vec<PathBuf> {
+    task["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|file| file["path"].as_str())
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
 #[derive(Deserialize)]
 pub struct EnqueueRequest {
     pub path: String,
@@ -638,6 +695,7 @@ pub async fn download_status(
 ) -> Json<ApiResponse<Vec<DownloadTaskView>>> {
     let config = state.config.read().await.clone();
     let local_path_normalized = config.local_path.replace("\\", "/");
+    let local_path_buf = PathBuf::from(&config.local_path);
     let mut view_tasks = Vec::new();
     if let Ok(all) = state.aria2_client.tell_all().await {
         for t in all {
@@ -691,6 +749,11 @@ pub async fn download_status(
             let file_name = task_file_name(&t).unwrap_or(file_name);
             let remote_path = task_remote_path(&t, &local_path_normalized).unwrap_or(remote_path);
 
+            if status_raw == "error" {
+                let files_to_clean = collect_task_file_paths(&t);
+                cleanup_download_artifacts(&files_to_clean, &local_path_buf);
+            }
+
             let status = match status_raw {
                 "active" => "Downloading",
                 "waiting" => "Queued",
@@ -728,50 +791,56 @@ pub async fn cancel_download(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TaskAction>,
 ) -> Json<ApiResponse<String>> {
-    // 先查询任务的文件路径信息，以便取消后清理残留
-    let mut files_to_clean: Vec<std::path::PathBuf> = Vec::new();
+    let mut files_to_clean: Vec<PathBuf> = Vec::new();
     if let Ok(status) = state.aria2_client.tell_status(&req.task_id).await {
-        if let Some(files) = status["files"].as_array() {
-            for f in files {
-                if let Some(path_str) = f["path"].as_str() {
-                    if !path_str.is_empty() {
-                        files_to_clean.push(std::path::PathBuf::from(path_str));
-                    }
-                }
-            }
-        }
+        files_to_clean = collect_task_file_paths(&status);
     }
 
-    // 移除 Aria2 任务
     let _ = state.aria2_client.remove(&req.task_id).await;
 
-    // 清理本地残留文件
     let config = state.config.read().await.clone();
-    let local_path_buf = std::path::PathBuf::from(&config.local_path);
-    for file_path in &files_to_clean {
-        // 删除主体文件
-        let _ = std::fs::remove_file(file_path);
-        // 删除 .aria2 侧载文件
-        let mut aria2_path = file_path.clone().into_os_string();
-        aria2_path.push(".aria2");
-        let _ = std::fs::remove_file(aria2_path);
+    let local_path_buf = PathBuf::from(&config.local_path);
+    cleanup_download_artifacts(&files_to_clean, &local_path_buf);
 
-        // 向上清理空文件夹
-        let mut current_dir = file_path.parent();
-        while let Some(parent) = current_dir {
-            if parent == local_path_buf || !parent.starts_with(&local_path_buf) { break; }
-            if let Ok(mut iter) = std::fs::read_dir(parent) {
-                if iter.next().is_none() {
-                    let _ = std::fs::remove_dir(parent);
-                } else { break; }
-            } else { break; }
-            current_dir = parent.parent();
+    refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
+
+    ok_response("Task cancelled".to_string())
+}
+
+pub async fn remove_download(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<TaskAction>,
+) -> Json<ApiResponse<String>> {
+    let task = match state.aria2_client.tell_status(&req.task_id).await {
+        Ok(task) => task,
+        Err(_) => {
+            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
+            return ok_response("Task removed".to_string());
+        }
+    };
+
+    let status = task["status"].as_str().unwrap_or("");
+    let files_to_clean = collect_task_file_paths(&task);
+    let config = state.config.read().await.clone();
+    let local_path_buf = PathBuf::from(&config.local_path);
+
+    match status {
+        "active" | "waiting" | "paused" => {
+            let _ = state.aria2_client.force_remove(&req.task_id).await;
+            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
+            cleanup_download_artifacts(&files_to_clean, &local_path_buf);
+        }
+        "complete" => {
+            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
+        }
+        _ => {
+            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
+            cleanup_download_artifacts(&files_to_clean, &local_path_buf);
         }
     }
 
     refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
-
-    ok_response("已取消并清理文件".to_string())
+    ok_response("Task removed".to_string())
 }
 
 pub async fn retry_download(
@@ -874,9 +943,6 @@ pub async fn clear_all(State(state): State<Arc<AppState>>) -> Json<ApiResponse<S
 // 安装向导与 Aria2 管理专区
 // ============================
 
-
-use tokio::sync::RwLock as TokioRwLock;
-use once_cell::sync::Lazy;
 
 #[derive(Serialize, Clone)]
 pub struct InstallProgress {

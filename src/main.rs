@@ -82,6 +82,7 @@ async fn main() {
         .route("/api/download/delete", post(api::delete_local_file))
         .route("/api/download/status", get(api::download_status))
         .route("/api/download/cancel", post(api::cancel_download))
+        .route("/api/download/remove", post(api::remove_download))
         .route("/api/download/retry", post(api::retry_download))
         .route("/api/download/pause-all", post(api::pause_all))
         .route("/api/download/resume-all", post(api::resume_all))
