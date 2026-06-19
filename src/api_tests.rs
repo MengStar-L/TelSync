@@ -1,6 +1,7 @@
 use crate::api::{
     build_update_info_from_release, cleanup_download_artifacts, cleanup_empty_parent_dirs,
-    collect_incomplete_task_file_paths, resolve_local_target,
+    collect_incomplete_task_file_paths, replace_executable_with_update, resolve_local_target,
+    update_artifact_paths,
 };
 use std::fs;
 use std::path::PathBuf;
@@ -109,6 +110,38 @@ fn collect_incomplete_task_file_paths_skips_completed_tasks() {
     let paths = collect_incomplete_task_file_paths(&tasks);
 
     assert_eq!(paths, vec![active, failed]);
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn update_artifact_paths_use_executable_directory() {
+    let root = temp_test_dir("update-paths");
+    let exe_path = root.join("telsync");
+
+    let (temp_path, backup_path) = update_artifact_paths(&exe_path).unwrap();
+
+    assert_eq!(temp_path, root.join("telsync.update.tmp"));
+    assert_eq!(backup_path, root.join("telsync.bak"));
+    assert!(update_artifact_paths(&PathBuf::new()).is_err());
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn replace_executable_with_update_keeps_backup() {
+    let root = temp_test_dir("replace-update");
+    let exe_path = root.join("telsync");
+    let temp_path = root.join("telsync.update.tmp");
+    let backup_path = root.join("telsync.bak");
+    fs::write(&exe_path, b"old").unwrap();
+    fs::write(&temp_path, b"new").unwrap();
+
+    replace_executable_with_update(&exe_path, &temp_path, &backup_path).unwrap();
+
+    assert_eq!(fs::read(&exe_path).unwrap(), b"new");
+    assert_eq!(fs::read(&backup_path).unwrap(), b"old");
+    assert!(!temp_path.exists());
 
     fs::remove_dir_all(root).unwrap();
 }

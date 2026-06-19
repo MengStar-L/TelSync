@@ -21,6 +21,7 @@ const API = {
     clearAll: () => fetch('/api/download/clear-all', { method: 'POST' }).then(r => r.json()),
     getInitStatus: () => fetch('/api/system/init-status').then(r => r.json()),
     getUpdateInfo: () => fetch('/api/system/update-info').then(r => r.json()),
+    applyUpdate: () => fetch('/api/system/apply-update', { method: 'POST' }).then(r => r.json()),
     getInstallProgress: () => fetch('/api/system/install-progress').then(r => r.json()),
     installAria2: (arch) => fetch('/api/system/install-aria2', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ arch }) }).then(r => r.json()),
     uploadAria2: (formData) => fetch('/api/system/upload-aria2', { method: 'POST', body: formData }).then(r => r.json()),
@@ -396,7 +397,7 @@ async function initMainApp() {
     document.getElementById('btnCheckUpdate')?.addEventListener('click', async () => {
         await loadUpdateInfo(true);
     });
-    document.getElementById('btnInstallUpdate')?.addEventListener('click', openUpdateDownload);
+    document.getElementById('btnInstallUpdate')?.addEventListener('click', applyUpdate);
     
     // 顶部操作栏事件
     document.getElementById('btnResumeAll')?.addEventListener('click', async () => { await API.resumeAll(); showToast('success', '已发送全部恢复请求'); pollDownloadStatus(); });
@@ -527,7 +528,7 @@ function renderUpdateInfo(info) {
 
     if (installBtn) {
         installBtn.style.display = info.has_update ? 'inline-flex' : 'none';
-        installBtn.textContent = info.asset_name ? `下载 ${info.asset_name}` : '查看发布页面';
+        installBtn.textContent = info.latest_version ? `安装 ${info.latest_version}` : '立即更新';
         installBtn.disabled = false;
     }
 }
@@ -551,16 +552,46 @@ function renderUpdateError(message) {
     }
 }
 
-async function openUpdateDownload() {
+async function applyUpdate() {
+    const installBtn = document.getElementById('btnInstallUpdate');
+    const statusBadge = document.getElementById('updateStatusBadge');
+    if (!currentUpdateInfo?.has_update) {
+        showToast('info', '当前已是最新版本');
+        return;
+    }
+
     try {
-        const target = currentUpdateInfo?.download_url || currentUpdateInfo?.release_url;
-        if (!target) {
-            throw new Error('未找到发布页面地址');
+        if (installBtn) {
+            installBtn.disabled = true;
+            installBtn.classList.add('loading');
+            installBtn.textContent = '正在更新...';
         }
-        window.open(target, '_blank', 'noopener,noreferrer');
-        showToast('success', '已打开更新页面');
+        if (statusBadge) {
+            statusBadge.className = 'wizard-status-badge info';
+            statusBadge.textContent = '正在更新';
+        }
+
+        const resp = await API.applyUpdate();
+        if (!resp.success) {
+            throw new Error(resp.message || '自动更新失败');
+        }
+
+        showToast('success', resp.data || '更新已安装，服务正在重启');
+        if (statusBadge) {
+            statusBadge.className = 'wizard-status-badge success';
+            statusBadge.textContent = '正在重启';
+        }
     } catch (e) {
-        showToast('error', '无法打开更新页面：' + e.message);
+        showToast('error', '自动更新失败：' + e.message);
+        if (installBtn) {
+            installBtn.disabled = false;
+            installBtn.classList.remove('loading');
+            installBtn.textContent = currentUpdateInfo?.latest_version ? `安装 ${currentUpdateInfo.latest_version}` : '立即更新';
+        }
+        if (statusBadge) {
+            statusBadge.className = 'wizard-status-badge success';
+            statusBadge.textContent = '有可用更新';
+        }
     }
 }
 

@@ -78,6 +78,7 @@ async fn main() {
         .route("/api/download/resume-all", post(api::resume_all))
         .route("/api/download/clear-failed", post(api::clear_failed))
         .route("/api/download/clear-all", post(api::clear_all))
+        .route("/api/system/apply-update", post(api::apply_update))
         .route("/api/system/open-update-download", post(api::open_update_download))
         .route("/api/system/install-aria2", post(api::install_aria2))
         .route("/api/system/upload-aria2", post(api::upload_aria2));

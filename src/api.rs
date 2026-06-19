@@ -6,7 +6,7 @@ use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::Json;
-use futures_util::stream;
+use futures_util::{stream, StreamExt};
 use once_cell::sync::Lazy;
 use reqwest::{Client, Url};
 use semver::Version;
@@ -17,6 +17,7 @@ use std::io::{copy, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock as TokioRwLock;
 use tracing::{error, info, warn};
 
@@ -760,6 +761,146 @@ async fn fetch_update_info() -> Result<UpdateInfo, String> {
     Ok(build_update_info_from_release(&release, &current_app_version()))
 }
 
+pub(crate) fn update_artifact_paths(exe_path: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let file_name = exe_path
+        .file_name()
+        .ok_or_else(|| "无法确定当前程序文件名".to_string())?
+        .to_string_lossy()
+        .to_string();
+    let parent = exe_path
+        .parent()
+        .ok_or_else(|| "无法确定当前程序目录".to_string())?;
+
+    Ok((
+        parent.join(format!("{}.update.tmp", file_name)),
+        parent.join(format!("{}.bak", file_name)),
+    ))
+}
+
+fn update_download_url(info: &UpdateInfo) -> Result<&str, String> {
+    if !info.has_update {
+        return Err("当前已是最新版本".to_string());
+    }
+    if !info.supported_arch || info.asset_name.is_none() || info.download_url == info.release_url {
+        return Err("未找到适用于当前架构的更新包".to_string());
+    }
+    if info.download_url.trim().is_empty() {
+        return Err("更新包下载地址为空".to_string());
+    }
+
+    Ok(&info.download_url)
+}
+
+async fn download_update_asset(download_url: &str, target_path: &Path) -> Result<(), String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(10 * 60))
+        .build()
+        .map_err(|e| format!("创建下载客户端失败: {}", e))?;
+    let response = client
+        .get(download_url)
+        .header("User-Agent", "TelSync")
+        .send()
+        .await
+        .map_err(|e| format!("下载更新包失败: {}", e))?
+        .error_for_status()
+        .map_err(|e| format!("下载更新包失败: {}", e))?;
+
+    let mut file = tokio::fs::File::create(target_path)
+        .await
+        .map_err(|e| format!("创建临时更新文件失败: {}", e))?;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("读取更新包失败: {}", e))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("写入更新包失败: {}", e))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| format!("保存更新包失败: {}", e))?;
+    drop(file);
+
+    let metadata = std::fs::metadata(target_path)
+        .map_err(|e| format!("检查更新包失败: {}", e))?;
+    if metadata.len() == 0 {
+        return Err("更新包为空".to_string());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(target_path, permissions)
+            .map_err(|e| format!("设置更新包执行权限失败: {}", e))?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn replace_executable_with_update(
+    exe_path: &Path,
+    temp_path: &Path,
+    backup_path: &Path,
+) -> Result<(), String> {
+    if !exe_path.exists() {
+        return Err("当前程序文件不存在".to_string());
+    }
+    if !temp_path.exists() {
+        return Err("临时更新文件不存在".to_string());
+    }
+    if backup_path.exists() {
+        std::fs::remove_file(backup_path)
+            .map_err(|e| format!("移除旧备份失败: {}", e))?;
+    }
+
+    std::fs::copy(exe_path, backup_path)
+        .map_err(|e| format!("备份当前程序失败: {}", e))?;
+
+    #[cfg(windows)]
+    {
+        if exe_path.exists() {
+            std::fs::remove_file(exe_path)
+                .map_err(|e| format!("准备替换当前程序失败: {}", e))?;
+        }
+    }
+
+    if let Err(e) = std::fs::rename(temp_path, exe_path) {
+        #[cfg(windows)]
+        {
+            let _ = std::fs::copy(backup_path, exe_path);
+        }
+        return Err(format!("替换当前程序失败: {}", e));
+    }
+
+    Ok(())
+}
+
+async fn install_update_from_info(info: &UpdateInfo) -> Result<(), String> {
+    if !cfg!(target_os = "linux") {
+        return Err("自动更新仅支持 Linux/OpenWrt 环境".to_string());
+    }
+
+    let download_url = update_download_url(info)?;
+    let exe_path = std::env::current_exe()
+        .map_err(|e| format!("无法确定当前程序路径: {}", e))?;
+    let (temp_path, backup_path) = update_artifact_paths(&exe_path)?;
+
+    let _ = std::fs::remove_file(&temp_path);
+    download_update_asset(download_url, &temp_path).await?;
+    replace_executable_with_update(&exe_path, &temp_path, &backup_path)?;
+
+    Ok(())
+}
+
+fn schedule_process_exit() {
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        info!("TelSync update installed; exiting for procd restart");
+        std::process::exit(0);
+    });
+}
+
 #[derive(Deserialize)]
 pub struct EnqueueRequest {
     pub path: String,
@@ -1208,6 +1349,20 @@ pub async fn open_update_download(
     };
 
     Ok(ok_response(target))
+}
+
+pub async fn apply_update(
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let info = fetch_update_info()
+        .await
+        .map_err(|e| err_response::<String>(&e))?;
+
+    install_update_from_info(&info)
+        .await
+        .map_err(|e| err_response::<String>(&e))?;
+    schedule_process_exit();
+
+    Ok(ok_response("更新已安装，服务正在重启".to_string()))
 }
 
 #[derive(Deserialize)]
