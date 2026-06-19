@@ -144,9 +144,20 @@ pub(crate) fn resolve_local_target(local_root: &Path, raw_path: &str) -> Result<
 }
 
 fn path_within_root(path: &Path, local_root: &Path) -> bool {
-    match (normalized_existing_path(path), normalized_existing_path(local_root)) {
-        (Ok(target), Ok(root)) => target.starts_with(&root),
-        _ => false,
+    let Ok(root) = normalized_existing_path(local_root) else {
+        return false;
+    };
+
+    if let Ok(target) = normalized_existing_path(path) {
+        return target.starts_with(&root);
+    }
+
+    match path
+        .parent()
+        .and_then(|parent| normalized_existing_path(parent).ok())
+    {
+        Some(parent) => parent.starts_with(&root),
+        None => false,
     }
 }
 
@@ -594,13 +605,15 @@ pub(crate) fn cleanup_empty_parent_dirs(start: &Path, local_root: &Path) {
     }
 }
 
-fn cleanup_download_artifacts(files: &[PathBuf], local_root: &Path) {
+pub(crate) fn cleanup_download_artifacts(files: &[PathBuf], local_root: &Path) {
     for file_path in files {
         if !path_within_root(file_path, local_root) {
             continue;
         }
         for path in tracked_aria2_related_paths(file_path) {
-            let _ = std::fs::remove_file(path);
+            if path_within_root(&path, local_root) {
+                let _ = std::fs::remove_file(path);
+            }
         }
         cleanup_empty_parent_dirs(file_path, local_root);
     }
@@ -614,6 +627,14 @@ fn collect_task_file_paths(task: &serde_json::Value) -> Vec<PathBuf> {
         .filter_map(|file| file["path"].as_str())
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
+        .collect()
+}
+
+pub(crate) fn collect_incomplete_task_file_paths(tasks: &[serde_json::Value]) -> Vec<PathBuf> {
+    tasks
+        .iter()
+        .filter(|task| task["status"].as_str().unwrap_or("") != "complete")
+        .flat_map(collect_task_file_paths)
         .collect()
 }
 
@@ -644,7 +665,7 @@ fn parse_version_tag(tag: &str) -> Option<Version> {
 fn extract_release_notes(body: &str) -> String {
     let trimmed = body.trim();
     if trimmed.is_empty() {
-        "No release notes.".to_string()
+        "暂无发布说明。".to_string()
     } else {
         trimmed.chars().take(1500).collect()
     }
@@ -1101,9 +1122,15 @@ pub async fn clear_failed(State(state): State<Arc<AppState>>) -> Json<ApiRespons
 }
 
 pub async fn clear_all(State(state): State<Arc<AppState>>) -> Json<ApiResponse<String>> {
+    let config = state.config.read().await.clone();
+    let local_path_buf = PathBuf::from(&config.local_path);
+    let mut files_to_clean: Vec<PathBuf> = Vec::new();
+
     let _ = state.aria2_client.pause_all().await; // 先尝试暂停
     if let Ok(all) = state.aria2_client.tell_all().await {
-        for t in all {
+        files_to_clean = collect_incomplete_task_file_paths(&all);
+
+        for t in &all {
             if let Some(gid) = t["gid"].as_str() {
                 let status = t["status"].as_str().unwrap_or("");
                 if status == "active" || status == "waiting" || status == "paused" {
@@ -1112,7 +1139,9 @@ pub async fn clear_all(State(state): State<Arc<AppState>>) -> Json<ApiResponse<S
             }
         }
     }
+    cleanup_download_artifacts(&files_to_clean, &local_path_buf);
     let _ = state.aria2_client.purge_download_result().await;
+    refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
     ok_response("已清空所有任务".to_string())
 }
 

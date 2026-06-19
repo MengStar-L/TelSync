@@ -468,7 +468,7 @@ async function loadUpdateInfo(showToastWhenNoUpdate) {
     try {
         const resp = await API.getUpdateInfo();
         if (!resp.success || !resp.data) {
-            throw new Error(resp.message || 'Failed to load update info');
+            throw new Error(resp.message || '获取更新信息失败');
         }
 
         renderUpdateInfo(resp.data);
@@ -476,14 +476,14 @@ async function loadUpdateInfo(showToastWhenNoUpdate) {
             showToast(
                 resp.data.has_update ? 'success' : 'info',
                 resp.data.has_update
-                    ? `Update ${resp.data.latest_version} is available`
-                    : 'You are already on the latest version'
+                    ? `发现新版本 ${resp.data.latest_version}`
+                    : '当前已是最新版本'
             );
         }
     } catch (e) {
         renderUpdateError(e.message);
         if (showToastWhenNoUpdate) {
-            showToast('error', 'Update check failed: ' + e.message);
+            showToast('error', '检查更新失败：' + e.message);
         }
     } finally {
         if (checkBtn) {
@@ -491,6 +491,17 @@ async function loadUpdateInfo(showToastWhenNoUpdate) {
             checkBtn.classList.remove('loading');
         }
     }
+}
+
+function localizeReleaseNotes(notes) {
+    if (!notes) return '暂无发布说明。';
+    return notes
+        .replace(/\*\*Full Changelog\*\*/gi, '**完整更新日志**')
+        .replace(/\bFull Changelog\b/gi, '完整更新日志')
+        .replace(/\bWhat's Changed\b/gi, '更新内容')
+        .replace(/\bBug Fixes\b/gi, '问题修复')
+        .replace(/\bFeatures\b/gi, '新增功能')
+        .replace(/\bNew Contributors\b/gi, '新增贡献者');
 }
 
 function renderUpdateInfo(info) {
@@ -502,21 +513,21 @@ function renderUpdateInfo(info) {
     document.getElementById('updateCurrentVersion').textContent = info.current_version || '--';
     document.getElementById('updateLatestVersion').textContent = info.latest_version || '--';
     document.getElementById('updatePublishedAt').textContent = publishedAt;
-    document.getElementById('updateNotes').textContent = info.release_notes || 'No release notes.';
+    document.getElementById('updateNotes').textContent = localizeReleaseNotes(info.release_notes);
 
     if (statusBadge) {
         if (info.has_update) {
             statusBadge.className = 'wizard-status-badge success';
-            statusBadge.textContent = 'Update available';
+            statusBadge.textContent = '有可用更新';
         } else {
             statusBadge.className = 'wizard-status-badge info';
-            statusBadge.textContent = 'Up to date';
+            statusBadge.textContent = '已是最新版本';
         }
     }
 
     if (installBtn) {
         installBtn.style.display = info.has_update ? 'inline-flex' : 'none';
-        installBtn.textContent = info.asset_name ? `Download ${info.asset_name}` : 'View release page';
+        installBtn.textContent = info.asset_name ? `下载 ${info.asset_name}` : '查看发布页面';
         installBtn.disabled = false;
     }
 }
@@ -526,12 +537,12 @@ function renderUpdateError(message) {
     document.getElementById('updateCurrentVersion').textContent = '--';
     document.getElementById('updateLatestVersion').textContent = '--';
     document.getElementById('updatePublishedAt').textContent = '--';
-    document.getElementById('updateNotes').textContent = message || 'Failed to load update information.';
+    document.getElementById('updateNotes').textContent = message || '获取更新信息失败。';
 
     const statusBadge = document.getElementById('updateStatusBadge');
     if (statusBadge) {
         statusBadge.className = 'wizard-status-badge error';
-        statusBadge.textContent = 'Check failed';
+        statusBadge.textContent = '检查失败';
     }
 
     const installBtn = document.getElementById('btnInstallUpdate');
@@ -544,12 +555,12 @@ async function openUpdateDownload() {
     try {
         const target = currentUpdateInfo?.download_url || currentUpdateInfo?.release_url;
         if (!target) {
-            throw new Error('No release URL available');
+            throw new Error('未找到发布页面地址');
         }
         window.open(target, '_blank', 'noopener,noreferrer');
-        showToast('success', 'Opened update page');
+        showToast('success', '已打开更新页面');
     } catch (e) {
-        showToast('error', 'Unable to open update page: ' + e.message);
+        showToast('error', '无法打开更新页面：' + e.message);
     }
 }
 
