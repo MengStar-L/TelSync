@@ -1,6 +1,7 @@
 use crate::state::FileNode;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
+use std::collections::HashSet;
 use tracing::info;
 
 #[derive(Debug, Deserialize)]
@@ -29,6 +30,12 @@ struct TelDriveMeta {
     next_cursor: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TelDriveSession {
+    #[serde(rename = "userId")]
+    user_id: i64,
+}
+
 pub struct TelDriveClient {
     client: Client,
     base_url: String,
@@ -53,6 +60,7 @@ impl TelDriveClient {
     async fn list_path(&self, path: &str) -> Result<Vec<TelDriveFile>, String> {
         let mut all_files = Vec::new();
         let mut cursor: Option<String> = None;
+        let mut seen_cursors = HashSet::new();
 
         loop {
             let mut url = format!(
@@ -86,7 +94,12 @@ impl TelDriveClient {
             all_files.extend(file_list.items);
 
             match file_list.meta.next_cursor {
-                Some(c) if !c.is_empty() => cursor = Some(c),
+                Some(c) if !c.is_empty() => {
+                    if !seen_cursors.insert(c.clone()) {
+                        return Err("TelDrive 返回重复分页游标，已停止扫描，请刷新重试".to_string());
+                    }
+                    cursor = Some(c);
+                }
                 _ => break,
             }
         }
@@ -145,7 +158,15 @@ impl TelDriveClient {
             .await
             .map_err(|e| format!("连接失败: {}", e))?;
 
-        classify_test_connection_status(resp.status())
+        classify_test_connection_status(resp.status())?;
+        let session: TelDriveSession = resp
+            .json()
+            .await
+            .map_err(|_| "返回内容不是有效的 TelDrive 登录信息，请检查服务器地址".to_string())?;
+        if session.user_id <= 0 {
+            return Err("TelDrive 登录信息无效，请重新获取 access_token".to_string());
+        }
+        Ok("连接成功".to_string())
     }
 }
 
@@ -163,8 +184,54 @@ fn classify_test_connection_status(status: StatusCode) -> Result<String, String>
 
 #[cfg(test)]
 mod tests {
-    use super::classify_test_connection_status;
+    use super::{classify_test_connection_status, TelDriveClient};
+    use axum::{routing::get, Router};
     use reqwest::StatusCode;
+
+    async fn mock_server(path: &str, body: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(path, get(move || async move { body }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (base_url, server)
+    }
+
+    #[tokio::test]
+    async fn connection_check_requires_a_real_session_response() {
+        for (body, expected_ok) in [
+            (r#"{"userId":123456}"#, true),
+            ("<html>Proxy login</html>", false),
+            ("{}", false),
+            ("null", false),
+            (r#"{"userId":0}"#, false),
+        ] {
+            let (url, server) = mock_server("/api/auth/session", body).await;
+            let result = TelDriveClient::new(&url, "test-token")
+                .test_connection()
+                .await;
+            server.abort();
+            assert_eq!(result.is_ok(), expected_ok, "{body}: {result:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_pagination_cursor_does_not_hang_refresh() {
+        let (url, server) = mock_server(
+            "/api/files",
+            r#"{"items":[],"meta":{"nextCursor":"repeated"}}"#,
+        )
+        .await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            TelDriveClient::new(&url, "test-token").fetch_tree("/"),
+        )
+        .await;
+        server.abort();
+        let error = result.expect("刷新不能无限请求同一页").unwrap_err();
+        assert!(error.contains("重复分页游标"));
+    }
 
     #[test]
     fn treats_200_as_success() {

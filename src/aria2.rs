@@ -64,7 +64,7 @@ impl Aria2Client {
             return Err(format!("RPC 返回错误: {:?}", err));
         }
 
-        Ok(json_resp["result"].clone())
+        json_resp.get("result").cloned().ok_or_else(|| "RPC 响应缺少结果".to_string())
     }
 
     pub async fn add_uri(
@@ -86,7 +86,8 @@ impl Aria2Client {
         let res = self
             .call("aria2.addUri", vec![json!([url]), options])
             .await?;
-        Ok(res.as_str().unwrap_or("").to_string())
+        res.as_str().filter(|gid| !gid.is_empty()).map(str::to_string)
+            .ok_or_else(|| "Aria2 未返回有效的任务编号".to_string())
     }
 
     /// 获取所有状态的任务：活跃的，等待的，已停止的
@@ -103,27 +104,20 @@ impl Aria2Client {
         ]);
 
         let mut all = Vec::new();
-        if let Ok(active) = self.call("aria2.tellActive", vec![keys.clone()]).await {
-            if let Some(arr) = active.as_array() {
-                all.extend(arr.clone());
+        let active = self.call("aria2.tellActive", vec![keys.clone()]).await?;
+        all.extend(active.as_array().ok_or("Aria2 任务列表格式错误")?.clone());
+        for method in ["aria2.tellWaiting", "aria2.tellStopped"] {
+            let mut offset = 0;
+            loop {
+                let result = self.call(method, vec![json!(offset), json!(1000), keys.clone()]).await?;
+                let tasks = result.as_array().ok_or("Aria2 任务列表格式错误")?;
+                all.extend(tasks.clone());
+                if tasks.len() < 1000 { break; }
+                offset += tasks.len();
             }
         }
-        if let Ok(waiting) = self
-            .call("aria2.tellWaiting", vec![json!(0), json!(1000), keys.clone()])
-            .await
-        {
-            if let Some(arr) = waiting.as_array() {
-                all.extend(arr.clone());
-            }
-        }
-        if let Ok(stopped) = self
-            .call("aria2.tellStopped", vec![json!(0), json!(1000), keys.clone()])
-            .await
-        {
-            if let Some(arr) = stopped.as_array() {
-                all.extend(arr.clone());
-            }
-        }
+        let mut seen = std::collections::HashSet::new();
+        all.retain(|task| task["gid"].as_str().map(|gid| seen.insert(gid.to_string())).unwrap_or(true));
         Ok(all)
     }
 
@@ -142,34 +136,24 @@ impl Aria2Client {
         self.call("aria2.tellStatus", vec![json!(gid), keys]).await
     }
 
-    pub async fn remove(&self, gid: &str) -> Result<(), String> {
-        let _ = self.call("aria2.remove", vec![json!(gid)]).await;
-        Ok(())
-    }
-
     pub async fn purge_download_result(&self) -> Result<(), String> {
-        let _ = self.call("aria2.purgeDownloadResult", vec![]).await;
-        Ok(())
+        self.call("aria2.purgeDownloadResult", vec![]).await.map(|_| ())
     }
 
     pub async fn remove_download_result(&self, gid: &str) -> Result<(), String> {
-        let _ = self.call("aria2.removeDownloadResult", vec![serde_json::json!(gid)]).await;
-        Ok(())
+        self.call("aria2.removeDownloadResult", vec![serde_json::json!(gid)]).await.map(|_| ())
     }
 
     pub async fn pause_all(&self) -> Result<(), String> {
-        let _ = self.call("aria2.pauseAll", vec![]).await;
-        Ok(())
+        self.call("aria2.pauseAll", vec![]).await.map(|_| ())
     }
 
     pub async fn unpause_all(&self) -> Result<(), String> {
-        let _ = self.call("aria2.unpauseAll", vec![]).await;
-        Ok(())
+        self.call("aria2.unpauseAll", vec![]).await.map(|_| ())
     }
 
     pub async fn force_remove(&self, gid: &str) -> Result<(), String> {
-        let _ = self.call("aria2.forceRemove", vec![serde_json::json!(gid)]).await;
-        Ok(())
+        self.call("aria2.forceRemove", vec![serde_json::json!(gid)]).await.map(|_| ())
     }
 
     pub async fn change_global_option(&self, options: serde_json::Value) -> Result<Value, String> {
@@ -218,7 +202,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn cleanup_managed_aria2_processes(port: u16, aria2_path: &Path) {
+async fn cleanup_managed_aria2_processes(port: u16, aria2_path: &Path) {
     let target_path = normalize_path(aria2_path);
     let mut system = System::new_all();
     system.refresh_all();
@@ -227,26 +211,19 @@ fn cleanup_managed_aria2_processes(port: u16, aria2_path: &Path) {
     let port_flag = format!("--rpc-listen-port={}", port);
 
     for process in system.processes().values() {
-        let cmd = process
+        let args = process
             .cmd()
             .iter()
             .map(|part| part.to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let port_matches = cmd.contains(&port_flag);
+            .collect::<Vec<_>>();
+        let port_matches = args.iter().enumerate().any(|(i, arg)| {
+            arg == &port_flag || (arg == "--rpc-listen-port" && args.get(i + 1) == Some(&port.to_string()))
+        });
         let exe_matches = process
             .exe()
             .map(|exe| same_path(exe, &target_path))
             .unwrap_or(false);
-        let looks_like_aria2 = process
-            .name()
-            .to_string_lossy()
-            .to_ascii_lowercase()
-            .contains("aria2");
-
-        if (exe_matches && (port_matches || cmd.contains("--enable-rpc=true")))
-            || (port_matches && looks_like_aria2)
-        {
+        if exe_matches && port_matches {
             if process.kill() {
                 killed += 1;
             } else {
@@ -257,7 +234,7 @@ fn cleanup_managed_aria2_processes(port: u16, aria2_path: &Path) {
 
     if killed > 0 {
         info!("已清理 {} 个旧的 Aria2 进程", killed);
-        std::thread::sleep(Duration::from_millis(250));
+        tokio::time::sleep(Duration::from_millis(250)).await;
     }
 }
 
@@ -276,7 +253,7 @@ pub struct SpawnAria2Options<'a> {
     pub rpc_secret: &'a str,
 }
 
-pub fn spawn_aria2(options: SpawnAria2Options<'_>) -> Result<(), String> {
+pub async fn spawn_aria2(options: SpawnAria2Options<'_>) -> Result<(), String> {
     let aria2_exe = aria2_binary_path();
     let SpawnAria2Options {
         local_dir,
@@ -293,7 +270,7 @@ pub fn spawn_aria2(options: SpawnAria2Options<'_>) -> Result<(), String> {
         return Err("未找到 Aria2".to_string());
     }
 
-    cleanup_managed_aria2_processes(port, &aria2_exe);
+    cleanup_managed_aria2_processes(port, &aria2_exe).await;
 
     info!("启动 Aria2 进程 (端口 {})...", port);
     let mut cmd = Command::new(&aria2_exe);
@@ -336,7 +313,7 @@ pub fn spawn_aria2(options: SpawnAria2Options<'_>) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("无法启动 aria2: {}", e))?;
 
-    std::thread::sleep(Duration::from_millis(200));
+    tokio::time::sleep(Duration::from_millis(200)).await;
     if let Some(status) = child
         .try_wait()
         .map_err(|e| format!("检查 aria2 启动状态失败: {}", e))?

@@ -10,6 +10,7 @@ mod tree_sync;
 mod api_tests;
 
 use axum::http::header;
+use axum::extract::DefaultBodyLimit;
 use axum::response::Html;
 use axum::routing::{get, post};
 use axum::Router;
@@ -19,6 +20,9 @@ use tracing::{info, warn};
 const STATIC_HTML: &str = include_str!("../static/index.html");
 const STATIC_CSS: &str = include_str!("../static/style.css");
 const STATIC_JS: &str = include_str!("../static/app.js");
+const APP_MARK: &[u8] = include_bytes!("../static/assets/telsync-mark.svg");
+const DAYLIGHT_LANDSCAPE: &[u8] = include_bytes!("../static/assets/daylight-landscape.webp");
+const DAYLIGHT_PORTRAIT: &[u8] = include_bytes!("../static/assets/daylight-portrait.webp");
 
 #[tokio::main]
 async fn main() {
@@ -37,7 +41,7 @@ async fn main() {
     let rpc_port = 16800;
 
     if aria2::check_aria2_exists() {
-        let _ = aria2::spawn_aria2(aria2::SpawnAria2Options {
+        if let Err(e) = aria2::spawn_aria2(aria2::SpawnAria2Options {
             local_dir: &config.local_path,
             port: rpc_port,
             max_concurrent: config.max_concurrent_downloads,
@@ -46,7 +50,9 @@ async fn main() {
             proxy_passwd: &config.proxy_passwd,
             rpc_allow_remote: config.rpc_allow_remote,
             rpc_secret: &config.rpc_secret,
-        });
+        }).await {
+            warn!("Failed to start Aria2: {}. Setup wizard will guide installation.", e);
+        }
     } else {
         info!("Aria2 binary not found, setup wizard will guide installation");
     }
@@ -69,6 +75,7 @@ async fn main() {
         .route("/api/test-connection", post(api::test_connection))
         .route("/api/trees/initial", post(api::initial_trees))
         .route("/api/trees/refresh", post(api::refresh_trees))
+        .route("/api/trees/local", post(api::refresh_local_trees))
         .route("/api/download/enqueue", post(api::enqueue_download))
         .route("/api/download/delete", post(api::delete_local_file))
         .route("/api/download/cancel", post(api::cancel_download))
@@ -81,12 +88,18 @@ async fn main() {
         .route("/api/system/apply-update", post(api::apply_update))
         .route("/api/system/open-update-download", post(api::open_update_download))
         .route("/api/system/install-aria2", post(api::install_aria2))
-        .route("/api/system/upload-aria2", post(api::upload_aria2));
+        .route(
+            "/api/system/upload-aria2",
+            post(api::upload_aria2).layer(DefaultBodyLimit::max(64 * 1024 * 1024)),
+        );
 
     let app = Router::new()
         .route("/", get(serve_html))
         .route("/style.css", get(serve_css))
         .route("/app.js", get(serve_js))
+        .route("/assets/telsync-mark.svg", get(serve_app_mark))
+        .route("/assets/daylight-landscape.webp", get(serve_daylight_landscape))
+        .route("/assets/daylight-portrait.webp", get(serve_daylight_portrait))
         .route("/api/trees", get(api::get_trees))
         .route("/api/trees/events", get(api::tree_events))
         .route("/api/download/status", get(api::download_status))
@@ -100,10 +113,16 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
     info!("TelSync listening on http://0.0.0.0:{}", port);
 
-    let _ = open::that(format!("http://localhost:{}", port));
+    let _ = open::that(format!("http://localhost:{}", port)).map_err(|e| {
+        info!("Could not open browser automatically: {}", e);
+    });
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind to port. Is another instance running?");
+    axum::serve(listener, app)
+        .await
+        .expect("Server failed");
 }
 
 async fn serve_html() -> Html<&'static str> {
@@ -119,4 +138,16 @@ async fn serve_js() -> ([(header::HeaderName, &'static str); 1], &'static str) {
         [(header::CONTENT_TYPE, "application/javascript")],
         STATIC_JS,
     )
+}
+
+async fn serve_app_mark() -> ([(header::HeaderName, &'static str); 1], &'static [u8]) {
+    ([(header::CONTENT_TYPE, "image/svg+xml")], APP_MARK)
+}
+
+async fn serve_daylight_landscape() -> ([(header::HeaderName, &'static str); 1], &'static [u8]) {
+    ([(header::CONTENT_TYPE, "image/webp")], DAYLIGHT_LANDSCAPE)
+}
+
+async fn serve_daylight_portrait() -> ([(header::HeaderName, &'static str); 1], &'static [u8]) {
+    ([(header::CONTENT_TYPE, "image/webp")], DAYLIGHT_PORTRAIT)
 }

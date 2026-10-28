@@ -21,7 +21,9 @@ fn scan_dir_recursive(dir: &Path, relative_prefix: &str) -> Result<Vec<FileNode>
 
     let entries = std::fs::read_dir(dir).map_err(|e| format!("读取目录失败 {:?}: {}", dir, e))?;
 
-    let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+    let mut entries: Vec<_> = entries
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("读取目录项失败 {:?}: {}", dir, e))?;
     entries.sort_by_key(|a| a.file_name());
 
     for entry in entries {
@@ -45,6 +47,14 @@ fn scan_dir_recursive(dir: &Path, relative_prefix: &str) -> Result<Vec<FileNode>
             .metadata()
             .map_err(|e| format!("读取元数据失败: {}", e))?;
 
+        // aria2 会提前分配目标文件；控制文件存在时，目标仍是不完整的下载。
+        if !metadata.is_dir()
+            && (dir.join(format!("{}.aria2", file_name)).exists()
+                || dir.join(format!("{}.aria2__temp", file_name)).exists())
+        {
+            continue;
+        }
+
         if metadata.is_dir() {
             let children = scan_dir_recursive(&entry.path(), &child_path)?;
             nodes.push(FileNode {
@@ -57,7 +67,7 @@ fn scan_dir_recursive(dir: &Path, relative_prefix: &str) -> Result<Vec<FileNode>
                 exists_locally: true,
                 children,
             });
-        } else {
+        } else if metadata.is_file() {
             nodes.push(FileNode {
                 name: file_name,
                 path: child_path,
@@ -81,16 +91,16 @@ pub fn mark_local_existence(remote_nodes: &mut [FileNode], local_nodes: &[FileNo
         remote.exists_locally = false;
         let local_match = local_nodes.iter().find(|l| l.name == remote.name);
 
-        if let Some(local) = local_match {
-            if remote.is_dir && local.is_dir {
+        if remote.is_dir {
+            if let Some(local) = local_match.filter(|local| local.is_dir) {
                 remote.exists_locally = true;
                 mark_local_existence(&mut remote.children, &local.children);
-            } else if !remote.is_dir && !local.is_dir {
-                remote.exists_locally = true;
+            } else {
+                // 缺失目录或同名文件阻挡目录时，子节点都不能沿用旧标记。
+                reset_exists_locally(&mut remote.children);
             }
-        } else if remote.is_dir {
-            // 本地不存在该文件夹，递归重置子节点
-            reset_exists_locally(&mut remote.children);
+        } else if let Some(local) = local_match.filter(|local| !local.is_dir) {
+            remote.exists_locally = remote.size == local.size;
         }
     }
 }
@@ -102,5 +112,68 @@ fn reset_exists_locally(nodes: &mut [FileNode]) {
         if node.is_dir {
             reset_exists_locally(&mut node.children);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn file(name: &str, size: u64) -> FileNode {
+        FileNode {
+            name: name.to_string(),
+            path: format!("/{}", name),
+            is_dir: false,
+            size,
+            remote_id: None,
+            mime_type: None,
+            exists_locally: true,
+            children: vec![],
+        }
+    }
+
+    #[test]
+    fn incomplete_downloads_are_not_reported_as_local_files() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("telsync-scan-{}", suffix));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("partial.bin"), b"preallocated").unwrap();
+        std::fs::write(root.join("partial.bin.aria2"), b"state").unwrap();
+        std::fs::write(root.join("temporary.bin"), b"preallocated").unwrap();
+        std::fs::write(root.join("temporary.bin.aria2__temp"), b"state").unwrap();
+        std::fs::write(root.join("complete.bin"), b"done").unwrap();
+
+        let local = scan_local_dir(root.to_str().unwrap()).unwrap();
+        assert_eq!(local.len(), 1);
+        assert_eq!(local[0].name, "complete.bin");
+
+        std::fs::remove_file(root.join("partial.bin.aria2")).unwrap();
+        let local = scan_local_dir(root.to_str().unwrap()).unwrap();
+        assert!(local.iter().any(|node| node.name == "partial.bin"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn same_named_file_requires_matching_size() {
+        let mut remote = vec![file("incomplete.bin", 100), file("complete.bin", 100)];
+        let local = vec![file("incomplete.bin", 50), file("complete.bin", 100)];
+        mark_local_existence(&mut remote, &local);
+        assert!(!remote[0].exists_locally);
+        assert!(remote[1].exists_locally);
+    }
+
+    #[test]
+    fn file_blocking_remote_directory_clears_descendant_flags() {
+        let mut directory = file("folder", 0);
+        directory.is_dir = true;
+        directory.children = vec![file("child.bin", 10)];
+        let mut remote = vec![directory];
+        mark_local_existence(&mut remote, &[file("folder", 5)]);
+        assert!(!remote[0].exists_locally);
+        assert!(!remote[0].children[0].exists_locally);
     }
 }

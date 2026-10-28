@@ -95,12 +95,11 @@ fn normalized_existing_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn validate_relative_request_path(raw: &str) -> Result<PathBuf, String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
+    if raw.is_empty() {
         return Err("目标路径非法".to_string());
     }
 
-    let candidate = Path::new(trimmed);
+    let candidate = Path::new(raw);
     if candidate.is_absolute() {
         return Err("目标路径非法".to_string());
     }
@@ -128,7 +127,7 @@ pub(crate) fn resolve_local_target(local_root: &Path, raw_path: &str) -> Result<
 
     if joined.exists() {
         let canonical_target = normalized_existing_path(&joined)?;
-        if canonical_target.starts_with(&root) {
+        if canonical_target != root && canonical_target.starts_with(&root) {
             Ok(canonical_target)
         } else {
             Err("目标路径非法".to_string())
@@ -142,6 +141,15 @@ pub(crate) fn resolve_local_target(local_root: &Path, raw_path: &str) -> Result<
             Err("目标路径非法".to_string())
         }
     }
+}
+
+pub(crate) fn tree_relative_path(raw: &str) -> Result<String, String> {
+    if raw.starts_with("//") {
+        return Err("目标路径非法".to_string());
+    }
+    let relative = raw.strip_prefix('/').unwrap_or(raw);
+    validate_relative_request_path(relative)?;
+    Ok(relative.to_string())
 }
 
 fn path_within_root(path: &Path, local_root: &Path) -> bool {
@@ -188,7 +196,7 @@ fn build_save_message(base: &str, config: &AppConfig) -> String {
     }
 }
 
-fn spawn_aria2_from_config(config: &AppConfig) -> Result<(), String> {
+async fn spawn_aria2_from_config(config: &AppConfig) -> Result<(), String> {
     let local_path = if config.local_path.is_empty() {
         "."
     } else {
@@ -204,7 +212,7 @@ fn spawn_aria2_from_config(config: &AppConfig) -> Result<(), String> {
         proxy_passwd: &config.proxy_passwd,
         rpc_allow_remote: config.rpc_allow_remote,
         rpc_secret: &config.rpc_secret,
-    })
+    }).await
 }
 
 async fn restart_aria2_with_config(state: &Arc<AppState>, config: &AppConfig) -> String {
@@ -214,11 +222,12 @@ async fn restart_aria2_with_config(state: &Arc<AppState>, config: &AppConfig) ->
     }
 
     if let Err(e) = state.aria2_client.force_shutdown().await {
-        warn!("尝试关闭旧的 Aria2 进程失败，继续尝试重启: {}", e);
+        warn!("关闭旧的 Aria2 进程失败，保留当前进程: {}", e);
+        return build_save_message("配置已保存，但未能安全重启 Aria2；请重启程序后应用 RPC 设置", config);
     }
     tokio::time::sleep(Duration::from_millis(400)).await;
 
-    match spawn_aria2_from_config(config) {
+    match spawn_aria2_from_config(config).await {
         Ok(_) => {
             state.aria2_client.set_secret(config.rpc_secret.clone()).await;
             tokio::time::sleep(Duration::from_millis(350)).await;
@@ -261,39 +270,9 @@ async fn apply_aria2_config(
                 return build_save_message("配置已保存，Aria2 启动后会自动加载", config);
             }
 
-            match spawn_aria2_from_config(config) {
-                Ok(_) => {
-                    state.aria2_client.set_secret(config.rpc_secret.clone()).await;
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    match state
-                        .aria2_client
-                        .change_global_option(build_aria2_global_options(config))
-                        .await
-                    {
-                        Ok(_) => build_save_message("配置已保存，Aria2 已重连并应用", config),
-                        Err(retry_err) => {
-                            warn!(
-                                "Aria2 已尝试重连，但仍未能应用最新配置: {}; 初始错误: {}",
-                                retry_err, apply_err
-                            );
-                            build_save_message(
-                                "配置已保存，但当前未能连接 Aria2；下次启动后会自动加载",
-                                config,
-                            )
-                        }
-                    }
-                }
-                Err(spawn_err) => {
-                    warn!(
-                        "Aria2 配置未实时应用，已保存等待下次启动: {}; 启动失败: {}",
-                        apply_err, spawn_err
-                    );
-                    build_save_message(
-                        "配置已保存，但当前未能连接 Aria2；下次启动后会自动加载",
-                        config,
-                    )
-                }
-            }
+            // RPC 失败不代表进程停止，直接 spawn 会杀掉仍在运行的下载队列。
+            warn!("Aria2 配置未实时应用，保留现有进程与队列: {}", apply_err);
+            build_save_message("配置已保存，但当前未能连接 Aria2；请恢复服务或重启程序后应用", config)
         }
     }
 }
@@ -309,21 +288,20 @@ pub async fn save_config(
     State(state): State<Arc<AppState>>,
     Json(update): Json<ConfigUpdate>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
-    let mut config = state.config.write().await;
-    let previous_config = config.clone();
+    let _download_guard = DOWNLOAD_OPERATIONS.lock().await;
+    let tree_guard = state.tree_refresh_lock.lock().await;
+    let mut stored_config = state.config.write().await;
+    let previous_config = stored_config.clone();
+    let mut config = previous_config.clone();
 
     if let Some(url) = update.teldrive_url {
-        config.teldrive_url = url.trim_end_matches('/').to_string();
+        config.teldrive_url = url.trim().trim_end_matches('/').to_string();
     }
     if let Some(token) = update.access_token {
         config.access_token = token.trim().to_string();
     }
     if let Some(path) = update.local_path {
-        config.local_path = path
-            .trim()
-            .trim_end_matches('\\')
-            .trim_end_matches('/')
-            .to_string();
+        config.local_path = path.trim().to_string();
     }
     if let Some(max) = update.max_concurrent_downloads {
         config.max_concurrent_downloads = max.clamp(1, 5);
@@ -343,13 +321,30 @@ pub async fn save_config(
     if let Some(rpc_secret) = update.rpc_secret {
         config.rpc_secret = rpc_secret.trim().to_string();
     }
-    config.save().map_err(|e| err_response::<String>(&e))?;
-
     let restart_required = previous_config.rpc_allow_remote != config.rpc_allow_remote
         || previous_config.rpc_secret != config.rpc_secret;
+    if restart_required && crate::aria2::check_aria2_exists() {
+        let tasks = state.aria2_client.tell_all().await.map_err(|e| err_response::<String>(&format!("无法确认下载队列状态，RPC 设置未更改: {}", e)))?;
+        if tasks.iter().any(task_is_running) {
+            return Err(err_response("当前有未完成下载，更改 RPC 设置需要重启 Aria2；请先完成或取消这些任务"));
+        }
+    }
+    if !config.local_path.is_empty() && config.local_path != previous_config.local_path {
+        std::fs::create_dir_all(&config.local_path)
+            .map_err(|e| err_response::<String>(&format!("创建本地同步目录失败: {}", e)))?;
+    }
+    config.save().map_err(|e| err_response::<String>(&e))?;
 
+    let tree_config_changed = previous_config.teldrive_url != config.teldrive_url
+        || previous_config.access_token != config.access_token
+        || previous_config.local_path != config.local_path;
     let config_snapshot = config.clone();
-    drop(config);
+    *stored_config = config;
+    drop(stored_config);
+    if tree_config_changed {
+        tree_sync::clear_for_config_change(&state).await;
+    }
+    drop(tree_guard);
 
     let message = apply_aria2_config(&state, &config_snapshot, restart_required).await;
     Ok(ok_response(message))
@@ -360,8 +355,8 @@ pub async fn test_connection(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
     let config = state.config.read().await;
-    if !config.is_configured() {
-        return Err(err_response("请先完成配置"));
+    if config.teldrive_url.is_empty() || config.access_token.is_empty() {
+        return Err(err_response("请先填写 TelDrive 地址和 Access Token"));
     }
     let client = TelDriveClient::new(&config.teldrive_url, &config.access_token);
     drop(config);
@@ -392,16 +387,26 @@ pub async fn refresh_trees(
     Ok(ok_response(tree_response_from_snapshot(snapshot)))
 }
 
+pub async fn refresh_local_trees(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ApiResponse<TreeResponse>>, (StatusCode, Json<ApiResponse<TreeResponse>>)> {
+    let local_path = state.config.read().await.local_path.clone();
+    tree_sync::update_local_and_store(&state, &local_path, "local_update")
+        .await.map_err(|e| err_response::<TreeResponse>(&e))?;
+    Ok(ok_response(tree_response_from_snapshot(tree_sync::current_snapshot(&state).await)))
+}
+
 pub async fn initial_trees(State(state): State<Arc<AppState>>) -> Json<ApiResponse<TreeResponse>> {
     match tree_sync::refresh_and_store(&state, "startup").await {
         Ok(snapshot) => ok_response(tree_response_from_snapshot(snapshot)),
         Err(e) => {
             warn!("页面首次刷新失败，回退到缓存快照: {}", e);
             let snapshot = tree_sync::current_snapshot(&state).await;
+            let has_cache = snapshot.refreshed_at.is_some();
             Json(ApiResponse {
-                success: true,
+                success: has_cache,
                 data: Some(tree_response_from_snapshot(snapshot)),
-                message: Some("实时刷新失败，已显示上次缓存".to_string()),
+                message: Some(if has_cache { "实时刷新失败，已显示上次缓存".to_string() } else { e }),
             })
         }
     }
@@ -449,13 +454,8 @@ async fn refresh_local_tree_cache_if_possible(state: &Arc<AppState>, local_path:
     if local_path.is_empty() {
         return;
     }
-    match crate::scanner::scan_local_dir(local_path) {
-        Ok(local_tree) => {
-            if let Err(e) = tree_sync::update_local_and_store(state, local_tree, source).await {
-                warn!("持久化本地文件树快照失败: {}", e);
-            }
-        }
-        Err(e) => warn!("刷新本地文件树缓存失败: {}", e),
+    if let Err(e) = tree_sync::update_local_and_store(state, local_path, source).await {
+        warn!("刷新本地文件树缓存失败: {}", e);
     }
 }
 
@@ -531,13 +531,12 @@ fn task_remote_path(task: &serde_json::Value, local_path_normalized: &str) -> Op
 
     if let Some(dir) = task["dir"].as_str() {
         let dir_normalized = dir.replace("\\", "/");
-        let dir_lower = dir_normalized.to_lowercase();
-        let local_lower = local_path_normalized.to_lowercase();
-        let relative_dir = if dir_lower.starts_with(&local_lower) {
-            dir_normalized[local_path_normalized.len()..].to_string()
-        } else {
-            String::new()
-        };
+        let root = local_path_normalized.trim_end_matches('/');
+        let prefix = dir_normalized.get(..root.len())?;
+        let matches = if cfg!(windows) { prefix.eq_ignore_ascii_case(root) } else { prefix == root };
+        if !matches { return None; }
+        let relative_dir = &dir_normalized[root.len()..];
+        if !relative_dir.is_empty() && !relative_dir.starts_with('/') { return None; }
 
         let mut remote_path = format!("{}/{}", relative_dir, file_name).replace("//", "/");
         if !remote_path.starts_with('/') {
@@ -547,16 +546,6 @@ fn task_remote_path(task: &serde_json::Value, local_path_normalized: &str) -> Op
     }
 
     Some(format!("/.../{}", file_name))
-}
-
-fn extract_retry_url(task: &serde_json::Value) -> Option<String> {
-    task["files"]
-        .as_array()?
-        .first()?
-        .get("uris")?
-        .as_array()?
-        .iter()
-        .find_map(|uri| uri["uri"].as_str().map(str::to_string))
 }
 
 fn find_remote_id_by_path(nodes: &[FileNode], remote_path: &str) -> Option<String> {
@@ -634,8 +623,7 @@ fn collect_task_file_paths(task: &serde_json::Value) -> Vec<PathBuf> {
 pub(crate) fn collect_incomplete_task_file_paths(tasks: &[serde_json::Value]) -> Vec<PathBuf> {
     tasks
         .iter()
-        .filter(|task| task["status"].as_str().unwrap_or("") != "complete")
-        .flat_map(collect_task_file_paths)
+        .flat_map(|task| unprotected_task_file_paths(task, tasks))
         .collect()
 }
 
@@ -911,10 +899,47 @@ pub struct EnqueueResponse {
     pub added_count: usize,
 }
 
+pub(crate) fn download_directory(local_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
+    let relative = validate_relative_request_path(relative_path)?;
+    std::fs::create_dir_all(local_root).map_err(|e| format!("创建本地目录失败: {}", e))?;
+    let root = normalized_existing_path(local_root)?;
+    let mut directory = root.clone();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            directory.push(component);
+            if !directory.exists() {
+                std::fs::create_dir(&directory).map_err(|e| format!("创建下载目录失败: {}", e))?;
+            }
+            directory = normalized_existing_path(&directory)?;
+            if !directory.starts_with(&root) { return Err("下载路径超出本地目录".to_string()); }
+        }
+    }
+    let target = directory.join(relative.file_name().ok_or("文件名无效")?);
+    if target.exists() && !normalized_existing_path(&target)?.starts_with(&root) {
+        return Err("下载路径超出本地目录".to_string());
+    }
+    Ok(directory)
+}
+
+pub(crate) fn ensure_resumable_target(path: &Path) -> Result<(), String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("检查本地文件失败 {}: {}", path.display(), error)),
+    };
+    let mut control_path = path.as_os_str().to_os_string();
+    control_path.push(".aria2");
+    if !metadata.is_file() || (metadata.len() > 0 && !Path::new(&control_path).is_file()) {
+        return Err(format!("本地同名文件冲突：{}；未找到可用的 .aria2 断点文件，请先处理本地文件后再下载", path.display()));
+    }
+    Ok(())
+}
+
 pub async fn enqueue_download(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EnqueueRequest>,
 ) -> Result<Json<ApiResponse<EnqueueResponse>>, (StatusCode, Json<ApiResponse<EnqueueResponse>>)> {
+    let _guard = DOWNLOAD_OPERATIONS.lock().await;
     let remote_tree = state.remote_tree.read().await;
     let remote_nodes = remote_tree
         .as_ref()
@@ -938,35 +963,39 @@ pub async fn enqueue_download(
     drop(remote_tree);
 
     let config = state.config.read().await.clone();
-    let mut added = 0;
-
+    if !config.is_configured() { return Err(err_response("请先完成配置")); }
+    let existing = state.aria2_client.tell_all().await.map_err(|e| err_response::<EnqueueResponse>(&e))?;
+    let mut queued_paths = std::collections::HashSet::new();
+    for task in existing.iter().filter(|task| task_is_running(task)) {
+        if let Some(path) = task_remote_path(task, &config.local_path.replace('\\', "/")) {
+            queued_paths.insert(path);
+        }
+    }
+    // 整批预检通过后再调用 addUri，避免后续文件冲突时已经加入部分任务。
+    let mut prepared = Vec::new();
     for file in &files_to_download {
+        if queued_paths.contains(&file.path) { continue; }
         if let Some(ref id) = file.remote_id {
+            let relative_path = tree_relative_path(&file.path).map_err(|e| err_response::<EnqueueResponse>(&e))?;
+            let relative = Path::new(&relative_path);
+            if relative.file_name().map(|name| name != std::ffi::OsStr::new(&file.name)).unwrap_or(true) {
+                return Err(err_response("远程文件路径与文件名不一致"));
+            }
             let file_url = build_download_url(&config.teldrive_url, id, &file.path)
                 .map_err(|e| err_response::<EnqueueResponse>(&e))?;
-            let path_parts: Vec<&str> = file.path.split('/').filter(|p| !p.is_empty()).collect();
-            // path_parts = ["Hero", "VR", "test.mp4"] -> len 3. relative_dir = ["Hero", "VR"]
-            let relative_dir = if path_parts.len() > 1 {
-                path_parts[0..path_parts.len() - 1].join("/")
-            } else {
-                "".to_string()
-            };
-            let out_dir = if relative_dir.is_empty() {
-                config.local_path.clone()
-            } else {
-                let p = Path::new(&config.local_path).join(relative_dir);
-                std::fs::create_dir_all(&p).unwrap_or(());
-                p.to_string_lossy().to_string()
-            };
-
-            match state
-                .aria2_client
-                .add_uri(&file_url, &file.name, &out_dir, &config.access_token)
-                .await
-            {
-                Ok(_) => added += 1,
-                Err(e) => error!("添加 aria2 下载失败: {}", e),
-            }
+            let out_dir = download_directory(Path::new(&config.local_path), &relative_path)
+                .map_err(|e| err_response::<EnqueueResponse>(&e))?;
+            ensure_resumable_target(&out_dir.join(&file.name))
+                .map_err(|e| err_response::<EnqueueResponse>(&e))?;
+            prepared.push((file, file_url, out_dir.to_string_lossy().to_string()));
+            queued_paths.insert(file.path.clone());
+        }
+    }
+    let mut added = 0;
+    for (file, file_url, out_dir) in prepared {
+        match state.aria2_client.add_uri(&file_url, &file.name, &out_dir, &config.access_token).await {
+            Ok(_) => added += 1,
+            Err(e) => error!("添加 aria2 下载失败: {}", e),
         }
     }
 
@@ -974,7 +1003,7 @@ pub async fn enqueue_download(
         return Err(err_response(if files_to_download.is_empty() {
             "该目录下没有需要下载的新文件"
         } else {
-            "Aria2 添加任务失败，请检查服务状态"
+            "文件已在下载队列中，或 Aria2 添加任务失败"
         }));
     }
 
@@ -990,13 +1019,28 @@ pub async fn delete_local_file(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DeleteFileRequest>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let _guard = DOWNLOAD_OPERATIONS.lock().await;
     let config = state.config.read().await.clone();
     let local_root = PathBuf::from(&config.local_path);
+    // 文件树使用 /folder/file 形式的虚拟路径，不是操作系统绝对路径。
+    let relative_path = tree_relative_path(&req.path).map_err(|e| err_response::<String>(&e))?;
     let target_path =
-        resolve_local_target(&local_root, &req.path).map_err(|e| err_response::<String>(&e))?;
+        resolve_local_target(&local_root, &relative_path).map_err(|e| err_response::<String>(&e))?;
 
     if !target_path.exists() {
         return Err(err_response("本地文件不存在"));
+    }
+    if crate::aria2::check_aria2_exists() {
+        let tasks = state.aria2_client.tell_all().await.map_err(|e| err_response::<String>(&format!("无法确认下载状态，暂未删除: {}", e)))?;
+        for path in tasks.iter().filter(|task| task_is_running(task)).flat_map(collect_task_file_paths) {
+            let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| {
+                path.parent().and_then(|parent| std::fs::canonicalize(parent).ok())
+                    .and_then(|parent| path.file_name().map(|name| parent.join(name))).unwrap_or(path)
+            });
+            if resolved.starts_with(&target_path) {
+                return Err(err_response("该文件或目录中有未完成下载，请先取消相关任务"));
+            }
+        }
     }
 
     if target_path.is_dir() {
@@ -1031,12 +1075,12 @@ pub struct DownloadTaskView {
 
 pub async fn download_status(
     State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse<Vec<DownloadTaskView>>> {
+) -> Result<Json<ApiResponse<Vec<DownloadTaskView>>>, (StatusCode, Json<ApiResponse<Vec<DownloadTaskView>>>)> {
     let config = state.config.read().await.clone();
     let local_path_normalized = config.local_path.replace("\\", "/");
-    let local_path_buf = PathBuf::from(&config.local_path);
     let mut view_tasks = Vec::new();
-    if let Ok(all) = state.aria2_client.tell_all().await {
+    let all = state.aria2_client.tell_all().await.map_err(|e| err_response::<Vec<DownloadTaskView>>(&e))?;
+    {
         for t in all {
             let gid = t["gid"].as_str().unwrap_or("").to_string();
             let status_raw = t["status"].as_str().unwrap_or("unknown");
@@ -1053,50 +1097,13 @@ pub async fn download_status(
                 .parse()
                 .unwrap_or(0.0);
 
-            // get remote path from dir and filename (Aria2 doesn't store our relative path directly)
-            // But we can extract it from the file path.
-            let mut file_name = "Unknown".to_string();
-            let mut remote_path = "Unknown".to_string();
-            if let Some(files) = t["files"].as_array() {
-                if !files.is_empty() {
-                    let full_path = files[0]["path"].as_str().unwrap_or("");
-                    let path_obj = Path::new(full_path);
-                    if let Some(name) = path_obj.file_name() {
-                        file_name = name.to_string_lossy().to_string();
-                        
-                        // 从 dir 提取出相对路径以还原 remote_path
-                        if let Some(dir) = t["dir"].as_str() {
-                            let dir_normalized = dir.replace("\\", "/");
-                            let mut relative_dir = "".to_string();
-                            let dir_lower = dir_normalized.to_lowercase();
-                            let loc_lower = local_path_normalized.to_lowercase();
-                            if dir_lower.starts_with(&loc_lower) {
-                                relative_dir = dir_normalized[local_path_normalized.len()..].to_string();
-                            }
-                            let mut rp = format!("{}/{}", relative_dir, file_name).replace("//", "/");
-                            if !rp.starts_with('/') {
-                                rp = format!("/{}", rp);
-                            }
-                            remote_path = rp;
-                        } else {
-                            remote_path = format!("/.../{}", file_name);
-                        }
-                    }
-                }
-            }
-
-            let file_name = task_file_name(&t).unwrap_or(file_name);
-            let remote_path = task_remote_path(&t, &local_path_normalized).unwrap_or(remote_path);
-
-            if status_raw == "error" {
-                let files_to_clean = collect_task_file_paths(&t);
-                cleanup_download_artifacts(&files_to_clean, &local_path_buf);
-            }
+            let file_name = task_file_name(&t).unwrap_or_else(|| "Unknown".to_string());
+            let remote_path = task_remote_path(&t, &local_path_normalized).unwrap_or_else(|| format!("/.../{}", file_name));
 
             let status = match status_raw {
                 "active" => "Downloading",
                 "waiting" => "Queued",
-                "paused" => "Queued",
+                "paused" => "Paused",
                 "error" => "Failed",
                 "complete" => "Completed",
                 "removed" => "Cancelled",
@@ -1118,7 +1125,7 @@ pub async fn download_status(
         }
     }
 
-    ok_response(view_tasks)
+    Ok(ok_response(view_tasks))
 }
 
 #[derive(Deserialize)]
@@ -1126,16 +1133,53 @@ pub struct TaskAction {
     pub task_id: String,
 }
 
+static DOWNLOAD_OPERATIONS: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+
+fn task_is_running(task: &serde_json::Value) -> bool {
+    matches!(task["status"].as_str(), Some("active" | "waiting" | "paused"))
+}
+
+async fn stop_task(state: &Arc<AppState>, task: &serde_json::Value) -> Result<serde_json::Value, String> {
+    if !task_is_running(task) { return Ok(task.clone()); }
+    let gid = task["gid"].as_str().ok_or("任务缺少编号")?;
+    state.aria2_client.force_remove(gid).await?;
+    // forceRemove 返回时 aria2 可能仍在写文件，确认停止后才能清理残片。
+    for _ in 0..30 {
+        let current = state.aria2_client.tell_status(gid).await?;
+        if !task_is_running(&current) { return Ok(current); }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("任务仍在停止中，请稍后重试".to_string())
+}
+
+pub(crate) fn unprotected_task_file_paths(task: &serde_json::Value, all: &[serde_json::Value]) -> Vec<PathBuf> {
+    if task["status"] == "complete" { return Vec::new(); }
+    let protected: Vec<PathBuf> = all.iter()
+        .filter(|other| other["gid"] != task["gid"] && (task_is_running(other) || other["status"] == "complete"))
+        .flat_map(collect_task_file_paths)
+        .collect();
+    collect_task_file_paths(task).into_iter().filter(|path| {
+        !protected.iter().any(|other| {
+            let left = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            let right = std::fs::canonicalize(other).unwrap_or_else(|_| other.clone());
+            if cfg!(windows) { left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy()) }
+            else { left == right }
+        })
+    }).collect()
+}
+
 pub async fn cancel_download(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TaskAction>,
-) -> Json<ApiResponse<String>> {
-    let mut files_to_clean: Vec<PathBuf> = Vec::new();
-    if let Ok(status) = state.aria2_client.tell_status(&req.task_id).await {
-        files_to_clean = collect_task_file_paths(&status);
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let _guard = DOWNLOAD_OPERATIONS.lock().await;
+    let task = state.aria2_client.tell_status(&req.task_id).await.map_err(|e| err_response::<String>(&e))?;
+    if !task_is_running(&task) {
+        return Err(err_response("仅能取消正在下载或等待的任务"));
     }
-
-    let _ = state.aria2_client.remove(&req.task_id).await;
+    let stopped = stop_task(&state, &task).await.map_err(|e| err_response::<String>(&e))?;
+    let all = state.aria2_client.tell_all().await.map_err(|e| err_response::<String>(&e))?;
+    let files_to_clean = unprotected_task_file_paths(&stopped, &all);
 
     let config = state.config.read().await.clone();
     let local_path_buf = PathBuf::from(&config.local_path);
@@ -1143,85 +1187,78 @@ pub async fn cancel_download(
 
     refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
 
-    ok_response("Task cancelled".to_string())
+    Ok(ok_response("任务已取消".to_string()))
 }
 
 pub async fn remove_download(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TaskAction>,
-) -> Json<ApiResponse<String>> {
-    let task = match state.aria2_client.tell_status(&req.task_id).await {
-        Ok(task) => task,
-        Err(_) => {
-            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
-            return ok_response("Task removed".to_string());
-        }
-    };
-
-    let status = task["status"].as_str().unwrap_or("");
-    let files_to_clean = collect_task_file_paths(&task);
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let _guard = DOWNLOAD_OPERATIONS.lock().await;
+    let task = state.aria2_client.tell_status(&req.task_id).await.map_err(|e| err_response::<String>(&e))?;
+    let stopped = stop_task(&state, &task).await.map_err(|e| err_response::<String>(&e))?;
+    let all = state.aria2_client.tell_all().await.map_err(|e| err_response::<String>(&e))?;
+    let files_to_clean = unprotected_task_file_paths(&stopped, &all);
     let config = state.config.read().await.clone();
     let local_path_buf = PathBuf::from(&config.local_path);
 
-    match status {
-        "active" | "waiting" | "paused" => {
-            let _ = state.aria2_client.force_remove(&req.task_id).await;
-            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
-            cleanup_download_artifacts(&files_to_clean, &local_path_buf);
-        }
-        "complete" => {
-            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
-        }
-        _ => {
-            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
-            cleanup_download_artifacts(&files_to_clean, &local_path_buf);
-        }
-    }
+    state.aria2_client.remove_download_result(&req.task_id).await.map_err(|e| err_response::<String>(&e))?;
+    cleanup_download_artifacts(&files_to_clean, &local_path_buf);
 
     refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
-    ok_response("Task removed".to_string())
+    Ok(ok_response("任务已移除".to_string()))
 }
 
 pub async fn retry_download(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TaskAction>,
-) -> Json<ApiResponse<String>> {
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let _guard = DOWNLOAD_OPERATIONS.lock().await;
     let task = match state.aria2_client.tell_status(&req.task_id).await {
         Ok(task) => task,
-        Err(e) => return ok_response(format!("Failed to load task details: {}", e)),
+        Err(e) => return Err(err_response(&format!("读取任务失败: {}", e))),
     };
 
     let status = task["status"].as_str().unwrap_or("");
     if status != "error" && status != "removed" {
-        return ok_response("Task is not retryable".to_string());
+        return Err(err_response("该任务无法重试"));
     }
 
     let file_name = match task_file_name(&task) {
         Some(name) => name,
-        None => return ok_response("Missing original file name".to_string()),
+        None => return Err(err_response("缺少原始文件名")),
     };
     let out_dir = task["dir"].as_str().unwrap_or("").to_string();
     if out_dir.is_empty() {
-        return ok_response("Missing original download directory".to_string());
+        return Err(err_response("缺少原始下载目录"));
     }
 
     let config = state.config.read().await.clone();
     let local_path_normalized = config.local_path.replace("\\", "/");
-    let mut retry_url = extract_retry_url(&task);
-    if retry_url.is_none() {
-        if let Some(remote_path) = task_remote_path(&task, &local_path_normalized) {
-            let remote_tree = state.remote_tree.read().await;
-            if let Some(remote_nodes) = remote_tree.as_ref() {
-                if let Some(remote_id) = find_remote_id_by_path(remote_nodes, &remote_path) {
-                    retry_url = build_download_url(&config.teldrive_url, &remote_id, &remote_path).ok();
-                }
+    let files = collect_task_file_paths(&task);
+    if files.is_empty() || files.iter().any(|path| !path_within_root(path, Path::new(&config.local_path))) {
+        return Err(err_response("任务下载位置不属于当前本地目录，请从文件管理重新添加"));
+    }
+    let all = state.aria2_client.tell_all().await.map_err(|e| err_response::<String>(&e))?;
+    if unprotected_task_file_paths(&task, &all).len() != files.len() {
+        return Err(err_response("同一文件已有下载任务或已完成，请勿重复重试"));
+    }
+    for file in &files {
+        ensure_resumable_target(file).map_err(|e| err_response::<String>(&e))?;
+    }
+    let mut retry_url = None;
+    if let Some(remote_path) = task_remote_path(&task, &local_path_normalized) {
+        let remote_tree = state.remote_tree.read().await;
+        if let Some(remote_nodes) = remote_tree.as_ref() {
+            if let Some(remote_id) = find_remote_id_by_path(remote_nodes, &remote_path) {
+                retry_url = build_download_url(&config.teldrive_url, &remote_id, &remote_path).ok();
             }
         }
     }
 
     let retry_url = match retry_url {
         Some(url) => url,
-        None => return ok_response("Missing retry source information".to_string()),
+        None => return Err(err_response("当前远程文件树中未找到该文件，请刷新后重试")),
     };
 
     match state
@@ -1230,60 +1267,58 @@ pub async fn retry_download(
         .await
     {
         Ok(_) => {
-            let _ = state.aria2_client.remove_download_result(&req.task_id).await;
-            ok_response("Task requeued".to_string())
-        }
-        Err(e) => ok_response(format!("Retry failed: {}", e)),
-    }
-}
-
-pub async fn pause_all(State(state): State<Arc<AppState>>) -> Json<ApiResponse<String>> {
-    let _ = state.aria2_client.pause_all().await;
-    ok_response("已暂停全部".to_string())
-}
-
-pub async fn resume_all(State(state): State<Arc<AppState>>) -> Json<ApiResponse<String>> {
-    let _ = state.aria2_client.unpause_all().await;
-    ok_response("已恢复全部".to_string())
-}
-
-
-
-pub async fn clear_failed(State(state): State<Arc<AppState>>) -> Json<ApiResponse<String>> {
-    if let Ok(all) = state.aria2_client.tell_all().await {
-        for t in all {
-            if t["status"].as_str().unwrap_or("") == "error" {
-                if let Some(gid) = t["gid"].as_str() {
-                    let _ = state.aria2_client.remove_download_result(gid).await;
-                }
+            if let Err(e) = state.aria2_client.remove_download_result(&req.task_id).await {
+                warn!("新任务已加入，但移除旧任务记录失败: {}", e);
             }
+            Ok(ok_response("任务已重新加入队列".to_string()))
         }
+        Err(e) => Err(err_response(&format!("重试失败: {}", e))),
     }
-    ok_response("已清理失败任务".to_string())
 }
 
-pub async fn clear_all(State(state): State<Arc<AppState>>) -> Json<ApiResponse<String>> {
+pub async fn pause_all(State(state): State<Arc<AppState>>) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let _guard = DOWNLOAD_OPERATIONS.lock().await;
+    state.aria2_client.pause_all().await.map_err(|e| err_response::<String>(&e))?;
+    Ok(ok_response("已暂停全部".to_string()))
+}
+
+pub async fn resume_all(State(state): State<Arc<AppState>>) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let _guard = DOWNLOAD_OPERATIONS.lock().await;
+    state.aria2_client.unpause_all().await.map_err(|e| err_response::<String>(&e))?;
+    Ok(ok_response("已恢复全部".to_string()))
+}
+
+
+
+pub async fn clear_failed(State(state): State<Arc<AppState>>) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let _guard = DOWNLOAD_OPERATIONS.lock().await;
+    let all = state.aria2_client.tell_all().await.map_err(|e| err_response::<String>(&e))?;
+    let config = state.config.read().await.clone();
+    for task in &all {
+        if task["status"] == "error" {
+            let gid = task["gid"].as_str().ok_or_else(|| err_response::<String>("任务缺少编号"))?;
+            state.aria2_client.remove_download_result(gid).await.map_err(|e| err_response::<String>(&e))?;
+            cleanup_download_artifacts(&unprotected_task_file_paths(task, &all), Path::new(&config.local_path));
+        }
+    }
+    refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
+    Ok(ok_response("已清理失败任务".to_string()))
+}
+
+pub async fn clear_all(State(state): State<Arc<AppState>>) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let _guard = DOWNLOAD_OPERATIONS.lock().await;
     let config = state.config.read().await.clone();
     let local_path_buf = PathBuf::from(&config.local_path);
-    let mut files_to_clean: Vec<PathBuf> = Vec::new();
-
-    let _ = state.aria2_client.pause_all().await; // 先尝试暂停
-    if let Ok(all) = state.aria2_client.tell_all().await {
-        files_to_clean = collect_incomplete_task_file_paths(&all);
-
-        for t in &all {
-            if let Some(gid) = t["gid"].as_str() {
-                let status = t["status"].as_str().unwrap_or("");
-                if status == "active" || status == "waiting" || status == "paused" {
-                    let _ = state.aria2_client.force_remove(gid).await;
-                }
-            }
-        }
+    let all = state.aria2_client.tell_all().await.map_err(|e| err_response::<String>(&e))?;
+    for task in &all {
+        stop_task(&state, task).await.map_err(|e| err_response::<String>(&e))?;
     }
+    let stopped = state.aria2_client.tell_all().await.map_err(|e| err_response::<String>(&e))?;
+    let files_to_clean = collect_incomplete_task_file_paths(&stopped);
     cleanup_download_artifacts(&files_to_clean, &local_path_buf);
-    let _ = state.aria2_client.purge_download_result().await;
+    state.aria2_client.purge_download_result().await.map_err(|e| err_response::<String>(&e))?;
     refresh_local_tree_cache_if_possible(&state, &config.local_path, "local_update").await;
-    ok_response("已清空所有任务".to_string())
+    Ok(ok_response("已清空所有任务".to_string()))
 }
 
 // ============================
@@ -1312,6 +1347,7 @@ static INSTALL_STATE: Lazy<TokioRwLock<InstallProgress>> = Lazy::new(|| {
 pub struct InitStatus {
     pub aria2_installed: bool,
     pub app_configured: bool,
+    pub aria2_arch: &'static str,
 }
 
 pub async fn init_status(State(state): State<Arc<AppState>>) -> Json<ApiResponse<InitStatus>> {
@@ -1319,6 +1355,10 @@ pub async fn init_status(State(state): State<Arc<AppState>>) -> Json<ApiResponse
     ok_response(InitStatus {
         aria2_installed: crate::aria2::check_aria2_exists(),
         app_configured: config.is_configured(),
+        aria2_arch: if cfg!(target_os = "windows") && cfg!(target_arch = "x86_64") { "win-x64" }
+            else if cfg!(target_os = "linux") && cfg!(target_arch = "aarch64") { "linux-arm64" }
+            else if cfg!(target_os = "linux") && cfg!(target_arch = "x86_64") { "linux-x64" }
+            else { "" },
     })
 }
 
@@ -1375,6 +1415,22 @@ pub async fn install_aria2(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InstallRequest>,
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
+    let _guard = INSTALL_OPERATION.try_lock().map_err(|_| err_response::<String>("Aria2 正在安装，请等待当前操作完成"))?;
+    let result = install_aria2_inner(state, req).await;
+    if let Err((_, response)) = &result {
+        let mut progress = INSTALL_STATE.write().await;
+        progress.status = "failed".to_string();
+        progress.message = response.message.clone().unwrap_or_else(|| "安装失败".to_string());
+    }
+    result
+}
+
+static INSTALL_OPERATION: Lazy<tokio::sync::Mutex<()>> = Lazy::new(|| tokio::sync::Mutex::new(()));
+
+async fn install_aria2_inner(
+    state: Arc<AppState>,
+    req: InstallRequest,
+) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
     // 1) 通过 GitHub API 获取最新 release 的真实下载链接
     let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -1423,7 +1479,7 @@ pub async fn install_aria2(
             err_response::<String>(&format!("获取发布信息失败: {}", e))
         })?;
 
-    let release: serde_json::Value = meta_resp.json().await.map_err(|e| {
+    let release: serde_json::Value = meta_resp.error_for_status().map_err(|e| err_response::<String>(&format!("获取发布信息失败: {}", e)))?.json().await.map_err(|e| {
         err_response::<String>(&format!("解析发布信息失败: {}", e))
     })?;
 
@@ -1476,6 +1532,7 @@ pub async fn install_aria2(
                 let mut stream = resp.bytes_stream();
                 let mut buf = Vec::new();
                 let mut downloaded: u64 = 0;
+                let mut interrupted = false;
 
                 while let Some(chunk_result) = stream.next().await {
                     match chunk_result {
@@ -1490,12 +1547,13 @@ pub async fn install_aria2(
                         }
                         Err(e) => {
                             info!("源 {} 下载中断: {}", i + 1, e);
+                            interrupted = true;
                             break;
                         }
                     }
                 }
 
-                if downloaded > 0 && (total_bytes == 0 || downloaded >= total_bytes / 2) {
+                if !interrupted && downloaded > 0 && (total_bytes == 0 || downloaded == total_bytes) {
                     download_bytes = Some(bytes::Bytes::from(buf));
                     info!("源 {} 下载成功, {} 字节", i + 1, downloaded);
                     break;
@@ -1583,6 +1641,11 @@ pub async fn install_aria2(
         }
     }
 
+    // 启动成功后才向向导报告安装完成。
+    let config = state.config.read().await.clone();
+    spawn_aria2_from_config(&config).await.map_err(|e| err_response::<String>(&format!("Aria2 已解压但启动失败: {}", e)))?;
+    state.aria2_client.set_secret(config.rpc_secret.clone()).await;
+
     // 4) 完成
     {
         let mut s = INSTALL_STATE.write().await;
@@ -1595,15 +1658,6 @@ pub async fn install_aria2(
     }
     info!("Aria2 安装完成");
     
-    // 自动触发启动
-    let config = state.config.read().await;
-    if let Err(e) = spawn_aria2_from_config(&config) {
-        tracing::error!("Aria2 提取成功但自动启动失败: {}", e);
-    } else {
-        state.aria2_client.set_secret(config.rpc_secret.clone()).await;
-        info!("Aria2 安装后自动启动成功");
-    }
-
     Ok(ok_response("Aria2 安装成功".to_string()))
 }
 
@@ -1611,30 +1665,28 @@ pub async fn upload_aria2(
     State(state): State<Arc<AppState>>,
     mut multipart: Multipart
 ) -> Result<Json<ApiResponse<String>>, (StatusCode, Json<ApiResponse<String>>)> {
-    while let Some(field) = multipart.next_field().await.unwrap() {
-        let name = field.name().unwrap().to_string();
-        if name == "file" {
-            let data = field.bytes().await.unwrap();
+    let _guard = INSTALL_OPERATION.try_lock().map_err(|_| err_response::<String>("Aria2 正在安装，请等待当前操作完成"))?;
+    while let Some(field) = multipart.next_field().await.map_err(|e| err_response::<String>(&format!("读取上传文件失败: {}", e)))? {
+        if field.name() == Some("file") {
+            let data = field.bytes().await.map_err(|e| err_response::<String>(&format!("读取上传内容失败: {}", e)))?;
+            if data.is_empty() { return Err(err_response("上传文件为空")); }
             let target_name = if cfg!(windows) { "aria2c.exe" } else { "aria2c" };
-            let mut f = File::create(target_name).unwrap();
-            f.write_all(&data).unwrap();
+            let mut f = File::create(target_name).map_err(|e| err_response::<String>(&format!("创建 Aria2 文件失败: {}", e)))?;
+            f.write_all(&data).map_err(|e| err_response::<String>(&format!("保存 Aria2 文件失败: {}", e)))?;
+            drop(f);
 
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(target_name).unwrap().permissions();
+                let mut perms = std::fs::metadata(target_name).map_err(|e| err_response::<String>(&e.to_string()))?.permissions();
                 perms.set_mode(0o755);
-                std::fs::set_permissions(target_name, perms).unwrap();
+                std::fs::set_permissions(target_name, perms).map_err(|e| err_response::<String>(&e.to_string()))?;
             }
 
             // 自动触发启动
-            let config = state.config.read().await;
-            if let Err(e) = spawn_aria2_from_config(&config) {
-                tracing::error!("Aria2 上传成功但自动启动失败: {}", e);
-            } else {
-                state.aria2_client.set_secret(config.rpc_secret.clone()).await;
-                info!("Aria2 上传后自动启动成功");
-            }
+            let config = state.config.read().await.clone();
+            spawn_aria2_from_config(&config).await.map_err(|e| err_response::<String>(&format!("Aria2 已上传但启动失败: {}", e)))?;
+            state.aria2_client.set_secret(config.rpc_secret.clone()).await;
 
             return Ok(ok_response("离线文件上传配置成功。".to_string()));
         }
